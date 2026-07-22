@@ -20,7 +20,7 @@ import {
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.1.0';
+} from './lib/core.js?v=1.1.1';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
@@ -94,7 +94,7 @@ function getSettingsHost() {
 
 function checkboxRow(label, key, help) {
     const row = document.createElement('label');
-    row.className = 'ehr-setting-row';
+    row.className = 'checkbox_label ehr-setting-row';
 
     const input = document.createElement('input');
     input.type = 'checkbox';
@@ -123,16 +123,25 @@ function renderSettings() {
         return;
     }
 
-    const root = document.createElement('details');
+    const root = document.createElement('div');
     root.id = ROOT_ID;
-    root.className = 'extension_container ehr-container';
+    root.className = 'inline-drawer ehr-container';
 
-    const summary = document.createElement('summary');
-    summary.className = 'ehr-summary';
-    summary.innerHTML = '<span><i class="fa-solid fa-fire-flame-curved"></i> 扩展热更新</span><small>更新后尽量直接生效</small>';
+    const header = document.createElement('div');
+    header.className = 'inline-drawer-toggle inline-drawer-header';
+    const heading = document.createElement('b');
+    heading.className = 'ehr-drawer-title';
+    const headingIcon = document.createElement('i');
+    headingIcon.className = 'fa-solid fa-fire-flame-curved';
+    const headingText = document.createElement('span');
+    headingText.textContent = '扩展热更新';
+    heading.append(headingIcon, headingText);
+    const drawerIcon = document.createElement('div');
+    drawerIcon.className = 'inline-drawer-icon fa-solid fa-circle-chevron-down down';
+    header.append(heading, drawerIcon);
 
     const body = document.createElement('div');
-    body.className = 'ehr-body';
+    body.className = 'inline-drawer-content ehr-body';
 
     const intro = document.createElement('div');
     intro.className = 'ehr-notice';
@@ -166,7 +175,7 @@ function renderSettings() {
     protocol.textContent = '扩展作者可在 manifest hooks 中声明 hot_reload、unload 或 disable，使脚本进入安全热更新路径。';
     body.append(protocol);
 
-    root.append(summary, body);
+    root.append(header, body);
     host.append(root);
 }
 
@@ -269,6 +278,12 @@ function captureRestartState(updatedExtensions) {
         documentScrollX: window.scrollX,
         documentScrollY: window.scrollY,
         openDetails: [...document.querySelectorAll('details[open][id]')].map((item) => item.id),
+        openInlineDrawers: [...document.querySelectorAll('.inline-drawer[id]')]
+            .filter((drawer) => {
+                const content = drawer.querySelector(':scope > .inline-drawer-content');
+                return content instanceof HTMLElement && getComputedStyle(content).display !== 'none';
+            })
+            .map((drawer) => drawer.id),
         focusedElementId: activeElement instanceof HTMLElement ? activeElement.id : '',
     };
 }
@@ -303,6 +318,18 @@ function restoreRestartState(state) {
     for (const id of state.openDetails ?? []) {
         const details = document.getElementById(id);
         if (details instanceof HTMLDetailsElement) details.open = true;
+    }
+
+    for (const id of state.openInlineDrawers ?? []) {
+        const drawer = document.getElementById(id);
+        if (!(drawer instanceof HTMLElement)) continue;
+        const content = drawer.querySelector(':scope > .inline-drawer-content');
+        const icon = drawer.querySelector(':scope > .inline-drawer-header .inline-drawer-icon');
+        if (content instanceof HTMLElement) content.style.display = 'block';
+        if (icon instanceof HTMLElement) {
+            icon.classList.remove('down', 'fa-circle-chevron-down');
+            icon.classList.add('up', 'fa-circle-chevron-up');
+        }
     }
 
     const chat = document.querySelector('#chat');

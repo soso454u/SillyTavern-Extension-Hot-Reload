@@ -1,33 +1,13 @@
-#extension-hot-reload-settings.ehr-container {
-    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 70%, #ff8a3d 30%);
-    border-radius: 8px;
-    margin: 0.75rem 0;
-    overflow: hidden;
-}
-
-.ehr-summary {
-    align-items: center;
-    cursor: pointer;
-    display: flex;
-    justify-content: space-between;
-    gap: 0.75rem;
-    padding: 0.75rem;
-    user-select: none;
-}
-
-.ehr-summary > span {
+#extension-hot-reload-settings .ehr-drawer-title {
     align-items: center;
     display: flex;
-    font-weight: 700;
     gap: 0.5rem;
 }
 
-.ehr-summary i,
 .extension-hot-reload-all i {
     color: #ff8a3d;
 }
 
-.ehr-summary small,
 .ehr-setting-row small,
 .ehr-mode-row small {
     display: block;
@@ -35,9 +15,11 @@
 }
 
 .ehr-body {
-    display: grid;
-    gap: 0.7rem;
-    padding: 0 0.75rem 0.85rem;
+    padding: 8px 10px 12px;
+}
+
+.ehr-body > * + * {
+    margin-top: 0.7rem;
 }
 
 .ehr-notice {
@@ -116,7 +98,6 @@
 }
 
 @media (max-width: 700px) {
-    .ehr-summary,
     .ehr-setting-row,
     .ehr-mode-row {
         align-items: flex-start;
