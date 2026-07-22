@@ -75,6 +75,46 @@
     border-color: color-mix(in srgb, currentColor 55%, #ff8a3d 45%);
 }
 
+#extension-hot-reload-restart-overlay {
+    align-items: center;
+    backdrop-filter: blur(8px);
+    background: color-mix(in srgb, var(--SmartThemeBlurTintColor) 88%, transparent);
+    display: flex;
+    inset: 0;
+    justify-content: center;
+    padding: 1.5rem;
+    position: fixed;
+    z-index: 100000;
+}
+
+.ehr-restart-card {
+    align-items: center;
+    background: var(--SmartThemeBlurTintColor);
+    border: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 55%, #ff8a3d 45%);
+    border-radius: 12px;
+    box-shadow: 0 16px 60px rgb(0 0 0 / 35%);
+    display: grid;
+    gap: 0.55rem;
+    justify-items: center;
+    max-width: 34rem;
+    padding: 1.4rem 1.6rem;
+    text-align: center;
+}
+
+.ehr-restart-card i {
+    color: #ff8a3d;
+    font-size: 1.7rem;
+}
+
+.ehr-restart-card strong {
+    font-size: 1.08rem;
+}
+
+.ehr-restart-card span {
+    line-height: 1.5;
+    opacity: 0.78;
+}
+
 @media (max-width: 700px) {
     .ehr-summary,
     .ehr-setting-row,

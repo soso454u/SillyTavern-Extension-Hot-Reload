@@ -4,7 +4,10 @@ import {
     getExtensionManifest,
 } from '../../../extensions.js';
 import {
+    eventSource,
+    event_types,
     getRequestHeaders,
+    isGenerating,
     saveSettingsDebounced,
 } from '../../../../script.js';
 import {
@@ -17,17 +20,21 @@ import {
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.0.0';
+} from './lib/core.js?v=1.1.0';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
 const ROOT_ID = 'extension-hot-reload-settings';
 const BULK_BUTTON_CLASS = 'extension-hot-reload-all';
+const RESTART_OVERLAY_ID = 'extension-hot-reload-restart-overlay';
+const RESTART_STATE_KEY = 'extension-hot-reload:restart-state';
+const RESTART_STATE_MAX_AGE = 2 * 60 * 1000;
 
 const DEFAULT_SETTINGS = Object.freeze({
     interceptUpdateButtons: true,
     showBulkButton: true,
     reloadStyles: true,
+    seamlessFallback: true,
     mode: HOT_RELOAD_MODE.SAFE,
     verboseLogging: false,
 });
@@ -41,6 +48,10 @@ let initialized = false;
 let managerObserver = null;
 let settings = null;
 let compatibilityReadyListener = null;
+let restoreReadyHandler = null;
+let restoreFallbackTimer = null;
+let generationResumeHandler = null;
+let restartPending = false;
 
 function log(...args) {
     if (settings?.verboseLogging) {
@@ -132,6 +143,7 @@ function renderSettings() {
         checkboxRow('接管单个扩展的更新按钮', 'interceptUpdateButtons', '点击原下载图标时执行智能热更新。'),
         checkboxRow('显示“智能热更新全部”', 'showBulkButton', '在扩展管理器工具栏加入一个火焰按钮。'),
         checkboxRow('立即替换样式文件', 'reloadStyles', 'CSS 可安全热替换，通常无需刷新页面。'),
+        checkboxRow('不兼容脚本自动无感重启', 'seamlessFallback', '保存输入和聊天位置，自动刷新运行环境并恢复；目标扩展无需适配。'),
     );
 
     const modeRow = document.createElement('label');
@@ -216,7 +228,186 @@ function captureUpdateClick(event) {
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    void updateOne(button.dataset.name, button);
+    void updateOne(button.dataset.name, button).then((result) => {
+        if (result.status === 'needs-page-reload' && settings.seamlessFallback) {
+            return requestSeamlessRestart([result.displayName ?? button.dataset.name]);
+        }
+    });
+}
+
+function findVisibleChatAnchor(chat) {
+    const chatRect = chat.getBoundingClientRect();
+    const messages = [...chat.querySelectorAll('.mes[mesid]')];
+    const anchor = messages.find((message) => {
+        const rect = message.getBoundingClientRect();
+        return rect.bottom > chatRect.top && rect.top < chatRect.bottom;
+    });
+    if (!anchor) return null;
+    const rect = anchor.getBoundingClientRect();
+    return {
+        messageId: anchor.getAttribute('mesid'),
+        offset: rect.top - chatRect.top,
+    };
+}
+
+function captureRestartState(updatedExtensions) {
+    const textarea = document.querySelector('#send_textarea');
+    const chat = document.querySelector('#chat');
+    const distanceFromBottom = chat ? chat.scrollHeight - chat.clientHeight - chat.scrollTop : 0;
+    const activeElement = document.activeElement;
+    return {
+        version: 1,
+        createdAt: Date.now(),
+        path: `${location.pathname}${location.search}${location.hash}`,
+        updatedExtensions: updatedExtensions.filter(Boolean).map(String),
+        draft: textarea instanceof HTMLTextAreaElement ? textarea.value : '',
+        selectionStart: textarea instanceof HTMLTextAreaElement ? textarea.selectionStart : null,
+        selectionEnd: textarea instanceof HTMLTextAreaElement ? textarea.selectionEnd : null,
+        chatScrollTop: chat instanceof HTMLElement ? chat.scrollTop : null,
+        chatAtBottom: Math.abs(distanceFromBottom) < 8,
+        chatAnchor: chat instanceof HTMLElement ? findVisibleChatAnchor(chat) : null,
+        documentScrollX: window.scrollX,
+        documentScrollY: window.scrollY,
+        openDetails: [...document.querySelectorAll('details[open][id]')].map((item) => item.id),
+        focusedElementId: activeElement instanceof HTMLElement ? activeElement.id : '',
+    };
+}
+
+function readRestartState() {
+    try {
+        const raw = sessionStorage.getItem(RESTART_STATE_KEY);
+        if (!raw) return null;
+        const state = JSON.parse(raw);
+        const currentPath = `${location.pathname}${location.search}${location.hash}`;
+        if (!state || state.version !== 1 || state.path !== currentPath || Date.now() - state.createdAt > RESTART_STATE_MAX_AGE) {
+            sessionStorage.removeItem(RESTART_STATE_KEY);
+            return null;
+        }
+        return state;
+    } catch (error) {
+        console.warn(LOG_PREFIX, 'Could not read seamless restart state:', error);
+        return null;
+    }
+}
+
+function restoreRestartState(state) {
+    const textarea = document.querySelector('#send_textarea');
+    if (textarea instanceof HTMLTextAreaElement) {
+        textarea.value = typeof state.draft === 'string' ? state.draft : '';
+        textarea.dispatchEvent(new Event('input', { bubbles: true }));
+        if (Number.isInteger(state.selectionStart) && Number.isInteger(state.selectionEnd)) {
+            textarea.setSelectionRange(state.selectionStart, state.selectionEnd);
+        }
+    }
+
+    for (const id of state.openDetails ?? []) {
+        const details = document.getElementById(id);
+        if (details instanceof HTMLDetailsElement) details.open = true;
+    }
+
+    const chat = document.querySelector('#chat');
+    if (chat instanceof HTMLElement) {
+        if (state.chatAtBottom) {
+            chat.scrollTop = chat.scrollHeight;
+        } else if (state.chatAnchor?.messageId != null) {
+            const selector = `.mes[mesid="${CSS.escape(String(state.chatAnchor.messageId))}"]`;
+            const anchor = chat.querySelector(selector);
+            if (anchor instanceof HTMLElement) {
+                const currentOffset = anchor.getBoundingClientRect().top - chat.getBoundingClientRect().top;
+                chat.scrollTop += currentOffset - Number(state.chatAnchor.offset ?? 0);
+            } else if (Number.isFinite(state.chatScrollTop)) {
+                chat.scrollTop = state.chatScrollTop;
+            }
+        } else if (Number.isFinite(state.chatScrollTop)) {
+            chat.scrollTop = state.chatScrollTop;
+        }
+    }
+
+    window.scrollTo(Number(state.documentScrollX ?? 0), Number(state.documentScrollY ?? 0));
+    if (state.focusedElementId === 'send_textarea' && textarea instanceof HTMLTextAreaElement && !matchMedia('(pointer: coarse)').matches) {
+        textarea.focus({ preventScroll: true });
+    }
+
+    sessionStorage.removeItem(RESTART_STATE_KEY);
+    const names = Array.isArray(state.updatedExtensions) ? state.updatedExtensions.join('、') : '';
+    notify('success', `${names || '扩展'} 已更新，输入内容和聊天位置已恢复。`, '无感重启完成');
+}
+
+function scheduleRestartStateRestore() {
+    const state = readRestartState();
+    if (!state) return;
+
+    let restored = false;
+    const restore = () => {
+        if (restored) return;
+        restored = true;
+        if (restoreReadyHandler) {
+            eventSource.removeListener(event_types.APP_READY, restoreReadyHandler);
+            restoreReadyHandler = null;
+        }
+        if (restoreFallbackTimer) {
+            clearTimeout(restoreFallbackTimer);
+            restoreFallbackTimer = null;
+        }
+        requestAnimationFrame(() => setTimeout(() => restoreRestartState(state), 80));
+    };
+
+    restoreReadyHandler = restore;
+    eventSource.once(event_types.APP_READY, restoreReadyHandler);
+    restoreFallbackTimer = setTimeout(restore, 5000);
+}
+
+function showRestartOverlay(updatedExtensions) {
+    document.getElementById(RESTART_OVERLAY_ID)?.remove();
+    const overlay = document.createElement('div');
+    overlay.id = RESTART_OVERLAY_ID;
+    const card = document.createElement('div');
+    card.className = 'ehr-restart-card';
+    const spinner = document.createElement('i');
+    spinner.className = 'fa-solid fa-arrows-rotate fa-spin';
+    const title = document.createElement('strong');
+    title.textContent = '扩展已更新，正在无感重启…';
+    const detail = document.createElement('span');
+    detail.textContent = `${updatedExtensions.filter(Boolean).join('、') || '目标扩展'} 的运行环境即将重新载入，输入内容和聊天位置会自动恢复。`;
+    card.append(spinner, title, detail);
+    overlay.append(card);
+    document.body.append(overlay);
+}
+
+async function performSeamlessRestart(updatedExtensions) {
+    if (restartPending) return;
+    restartPending = true;
+    try {
+        const state = captureRestartState(updatedExtensions);
+        sessionStorage.setItem(RESTART_STATE_KEY, JSON.stringify(state));
+    } catch (error) {
+        console.warn(LOG_PREFIX, 'Could not save seamless restart state:', error);
+        notify('warning', '无法保存完整界面状态，但仍会自动重新载入扩展。');
+    }
+    showRestartOverlay(updatedExtensions);
+    await new Promise((resolve) => setTimeout(resolve, 450));
+    location.reload();
+}
+
+async function requestSeamlessRestart(updatedExtensions) {
+    if (!settings.seamlessFallback || restartPending) return;
+    if (!isGenerating()) {
+        await performSeamlessRestart(updatedExtensions);
+        return;
+    }
+
+    restartPending = true;
+    notify('info', '检测到正在生成消息；更新已完成，将在生成结束后自动无感重启。');
+    const resume = () => {
+        eventSource.removeListener(event_types.GENERATION_ENDED, resume);
+        eventSource.removeListener(event_types.GENERATION_STOPPED, resume);
+        generationResumeHandler = null;
+        restartPending = false;
+        void performSeamlessRestart(updatedExtensions);
+    };
+    generationResumeHandler = resume;
+    eventSource.once(event_types.GENERATION_ENDED, resume);
+    eventSource.once(event_types.GENERATION_STOPPED, resume);
 }
 
 async function importExtensionModule(internalId, manifest, token = '') {
@@ -349,7 +540,7 @@ async function updateOne(rawId, button = null, options = {}) {
         if (result.isUpToDate) {
             if (!options.quiet) notify('success', `${oldManifest.display_name ?? externalId} 已经是最新版本。`);
             updateManagerRow(externalId, oldManifest, result.shortCommitHash);
-            return { status: 'up-to-date', result };
+            return { status: 'up-to-date', result, displayName: oldManifest.display_name ?? externalId };
         }
 
         const token = `${result.shortCommitHash ?? 'updated'}-${Date.now()}`;
@@ -416,12 +607,14 @@ async function updateOne(rawId, button = null, options = {}) {
             message = `${newManifest.display_name ?? externalId} 已更新${styleReloaded ? '，样式已立即生效' : ''}。`;
         } else {
             status = 'needs-page-reload';
-            message = `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新，但脚本没有清理钩子；为避免重复监听，本次未强制重载脚本。`;
+            message = settings.seamlessFallback
+                ? `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；脚本没有清理钩子，将自动无感重启以安全应用。`
+                : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新，但脚本没有清理钩子；为避免重复监听，本次未强制重载脚本。`;
         }
         if (!options.quiet) {
             notify(status === 'needs-page-reload' ? 'warning' : 'success', message);
         }
-        return { status, result, message };
+        return { status, result, message, displayName: newManifest.display_name ?? externalId };
     } catch (error) {
         console.error(LOG_PREFIX, `Failed to update ${externalId}:`, error);
         if (!options.quiet) notify('error', `${externalId} 更新失败：${error.message}`);
@@ -455,8 +648,14 @@ async function updateAllVisible(button) {
     const failed = results.filter((item) => item.status === 'failed').length;
     const needsReload = results.filter((item) => item.status === 'needs-page-reload').length;
     const hot = results.filter((item) => ['hot-reloaded', 'force-reloaded', 'style-reloaded', 'updated-disabled'].includes(item.status)).length;
-    const summary = `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个脚本需稍后刷新，${failed} 个失败。`;
+    const summary = settings.seamlessFallback && needsReload
+        ? `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个将通过一次无感重启应用，${failed} 个失败。`
+        : `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个脚本需稍后刷新，${failed} 个失败。`;
     notify(failed ? 'warning' : needsReload ? 'warning' : 'success', summary, '批量热更新完成');
+    if (needsReload && settings.seamlessFallback) {
+        const names = results.filter((item) => item.status === 'needs-page-reload').map((item) => item.displayName);
+        await requestSeamlessRestart(names);
+    }
 }
 
 function startObserver() {
@@ -472,9 +671,23 @@ function teardown() {
         document.removeEventListener('DOMContentLoaded', compatibilityReadyListener);
         compatibilityReadyListener = null;
     }
+    if (restoreReadyHandler) {
+        eventSource.removeListener(event_types.APP_READY, restoreReadyHandler);
+        restoreReadyHandler = null;
+    }
+    if (restoreFallbackTimer) {
+        clearTimeout(restoreFallbackTimer);
+        restoreFallbackTimer = null;
+    }
+    if (generationResumeHandler) {
+        eventSource.removeListener(event_types.GENERATION_ENDED, generationResumeHandler);
+        eventSource.removeListener(event_types.GENERATION_STOPPED, generationResumeHandler);
+        generationResumeHandler = null;
+    }
     managerObserver?.disconnect();
     managerObserver = null;
     document.getElementById(ROOT_ID)?.remove();
+    document.getElementById(RESTART_OVERLAY_ID)?.remove();
     document.querySelectorAll(`.${BULK_BUTTON_CLASS}`).forEach((button) => button.remove());
     initialized = false;
 }
@@ -483,6 +696,7 @@ function initialize() {
     if (initialized) return;
     initialized = true;
     loadSettings();
+    scheduleRestartStateRestore();
     renderSettings();
     document.addEventListener('click', captureUpdateClick, true);
     startObserver();
