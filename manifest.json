@@ -1,0 +1,17 @@
+{
+  "display_name": "Extension Hot Reload / 扩展热更新",
+  "loading_order": -1000,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "SillyTavern Community",
+  "version": "1.0.0",
+  "auto_update": true,
+  "hooks": {
+    "activate": "onActivate",
+    "update": "onUpdate",
+    "disable": "onDisable",
+    "hot_reload": "onHotUnload"
+  }
+}
