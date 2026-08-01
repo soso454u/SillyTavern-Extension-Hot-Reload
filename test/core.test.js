@@ -6,6 +6,7 @@ import {
     buildAssetUrl,
     classifyScriptReload,
     findCleanupHook,
+    findDeletionHook,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
@@ -54,6 +55,16 @@ test('finds explicit cleanup hooks before official disable hooks', () => {
     assert.deepEqual(findCleanupHook(manifest, { dispose: explicit, onDisable: disable }), {
         name: 'hot_reload', fn: explicit, level: 'explicit',
     });
+});
+
+test('finds only the official delete hook for deletion semantics', () => {
+    const onDelete = () => {};
+    const dispose = () => {};
+    const manifest = { hooks: { delete: 'onDelete', hot_reload: 'dispose' } };
+    assert.deepEqual(findDeletionHook(manifest, { onDelete, dispose }), {
+        name: 'delete', fn: onDelete, level: 'official',
+    });
+    assert.equal(findDeletionHook({ hooks: { hot_reload: 'dispose' } }, { dispose }), null);
 });
 
 test('classifies safe, disabled, and forced script reloads', () => {

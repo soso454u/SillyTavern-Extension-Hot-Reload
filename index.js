@@ -2,26 +2,31 @@ import {
     extension_settings,
     extensionTypes,
     getExtensionManifest,
+    loadExtensionSettings,
 } from '../../../extensions.js';
 import {
     eventSource,
     event_types,
     getRequestHeaders,
     isGenerating,
+    saveSettings,
     saveSettingsDebounced,
 } from '../../../../script.js';
+import { POPUP_RESULT, POPUP_TYPE, Popup } from '../../../popup.js';
+import { escapeHtml } from '../../../utils.js';
 import {
     HOT_RELOAD_MODE,
     buildAssetUrl,
     classifyScriptReload,
     findCleanupHook,
+    findDeletionHook,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.2.0';
+} from './lib/core.js?v=1.3.0';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
@@ -30,11 +35,12 @@ const BULK_BUTTON_CLASS = 'extension-hot-reload-all';
 const RESTART_OVERLAY_ID = 'extension-hot-reload-restart-overlay';
 const RESTART_STATE_KEY = 'extension-hot-reload:restart-state';
 const RESTART_STATE_MAX_AGE = 2 * 60 * 1000;
-const RESTART_STATE_VERSION = 2;
+const RESTART_STATE_VERSION = 3;
 const LATE_RESTORE_TIMEOUT = 6000;
 
 const DEFAULT_SETTINGS = Object.freeze({
     interceptUpdateButtons: true,
+    interceptDeleteButtons: true,
     showBulkButton: true,
     reloadStyles: true,
     seamlessFallback: true,
@@ -46,6 +52,8 @@ const DEFAULT_SETTINGS = Object.freeze({
 const runtimeManifests = new Map();
 /** @type {Set<string>} */
 const updating = new Set();
+/** @type {Set<string>} */
+const deleting = new Set();
 
 let initialized = false;
 let managerObserver = null;
@@ -137,11 +145,9 @@ function renderSettings() {
     header.className = 'inline-drawer-toggle inline-drawer-header';
     const heading = document.createElement('b');
     heading.className = 'ehr-drawer-title';
-    const headingIcon = document.createElement('i');
-    headingIcon.className = 'fa-solid fa-fire-flame-curved';
     const headingText = document.createElement('span');
     headingText.textContent = '扩展热更新';
-    heading.append(headingIcon, headingText);
+    heading.append(headingText);
     const drawerIcon = document.createElement('div');
     drawerIcon.className = 'inline-drawer-icon fa-solid fa-circle-chevron-down down';
     header.append(heading, drawerIcon);
@@ -151,11 +157,12 @@ function renderSettings() {
 
     const intro = document.createElement('div');
     intro.className = 'ehr-notice';
-    intro.textContent = '安全模式只热载入具备清理钩子的脚本；CSS 会直接换新。普通更新仍使用 SillyTavern 官方 Git 更新接口。';
+    intro.textContent = '安全模式只热载入具备清理钩子的脚本；CSS 会直接换新。更新与删除仍使用 SillyTavern 官方接口。';
 
     body.append(
         intro,
         checkboxRow('接管单个扩展的更新按钮', 'interceptUpdateButtons', '点击原下载图标时执行智能热更新。'),
+        checkboxRow('接管扩展删除按钮', 'interceptDeleteButtons', '删除后立即卸载；不兼容脚本自动无感重启。'),
         checkboxRow('显示“智能热更新全部”', 'showBulkButton', '在扩展管理器工具栏加入一个火焰按钮。'),
         checkboxRow('立即替换样式文件', 'reloadStyles', 'CSS 可安全热替换，通常无需刷新页面。'),
         checkboxRow('不兼容脚本自动无感重启', 'seamlessFallback', '保存输入和聊天位置，自动刷新运行环境并恢复；目标扩展无需适配。'),
@@ -224,30 +231,32 @@ function ensureUi() {
     decorateManager();
 }
 
-function findUpdateButton(event) {
+function findActionButton(event, selector) {
     if (!(event.target instanceof Element)) {
         return null;
     }
-    const button = event.target.closest('.btn_update');
-    return button instanceof HTMLButtonElement ? button : null;
+    const button = event.target.closest(selector);
+    return button instanceof HTMLElement ? button : null;
 }
 
 function captureUpdateClick(event) {
-    if (!settings?.interceptUpdateButtons) {
-        return;
-    }
-    const button = findUpdateButton(event);
-    if (!button || button.classList.contains('displayNone')) {
-        return;
-    }
+    const updateButton = settings?.interceptUpdateButtons ? findActionButton(event, '.btn_update') : null;
+    const deleteButton = settings?.interceptDeleteButtons ? findActionButton(event, '.btn_delete') : null;
+    const button = updateButton ?? deleteButton;
+    if (!button || button.classList.contains('displayNone')) return;
+
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
-    void updateOne(button.dataset.name, button).then((result) => {
-        if (result.status === 'needs-page-reload' && settings.seamlessFallback) {
-            return requestSeamlessRestart([result.displayName ?? button.dataset.name]);
-        }
-    });
+    if (updateButton) {
+        void updateOne(button.dataset.name, button).then((result) => {
+            if (result.status === 'needs-page-reload' && settings.seamlessFallback) {
+                return requestSeamlessRestart([result.displayName ?? button.dataset.name]);
+            }
+        });
+        return;
+    }
+    void confirmAndDelete(button.dataset.name, button);
 }
 
 function findVisibleChatAnchor(chat) {
@@ -271,7 +280,7 @@ function getDrawerTitle(drawer) {
     return normalizeDrawerTitle(title);
 }
 
-function captureOpenDrawerReferences() {
+function captureOpenDrawerReferences(excludedTitles = new Set()) {
     const occurrences = new Map();
     const references = [];
     for (const drawer of document.querySelectorAll('.inline-drawer')) {
@@ -281,31 +290,37 @@ function captureOpenDrawerReferences() {
         const content = drawer.querySelector(':scope > .inline-drawer-content');
         if (!(content instanceof HTMLElement) || getComputedStyle(content).display === 'none') continue;
         if (!drawer.id && !title) continue;
+        if (excludedTitles.has(title)) continue;
         references.push({ id: drawer.id || '', title, occurrence });
     }
     return references;
 }
 
-function captureScrollPositions() {
+function captureScrollPositions(excludedTitles = new Set()) {
     return [...document.querySelectorAll('[id]')]
         .filter((element) => element instanceof HTMLElement
             && element.id !== 'chat'
+            && !excludedTitles.has(getDrawerTitle(element.closest('.inline-drawer') ?? element))
             && (element.scrollTop !== 0 || element.scrollLeft !== 0)
             && (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth))
         .slice(0, 50)
         .map((element) => ({ id: element.id, top: element.scrollTop, left: element.scrollLeft }));
 }
 
-function captureRestartState(updatedExtensions) {
+function captureRestartState(updatedExtensions, action = 'update') {
     const textarea = document.querySelector('#send_textarea');
     const chat = document.querySelector('#chat');
     const distanceFromBottom = chat ? chat.scrollHeight - chat.clientHeight - chat.scrollTop : 0;
     const activeElement = document.activeElement;
+    const excludedTitles = action === 'delete'
+        ? new Set(updatedExtensions.map(normalizeDrawerTitle))
+        : new Set();
     return {
         version: RESTART_STATE_VERSION,
         createdAt: Date.now(),
         path: `${location.pathname}${location.search}${location.hash}`,
         updatedExtensions: updatedExtensions.filter(Boolean).map(String),
+        action,
         draft: textarea instanceof HTMLTextAreaElement ? textarea.value : '',
         selectionStart: textarea instanceof HTMLTextAreaElement ? textarea.selectionStart : null,
         selectionEnd: textarea instanceof HTMLTextAreaElement ? textarea.selectionEnd : null,
@@ -315,8 +330,8 @@ function captureRestartState(updatedExtensions) {
         documentScrollX: window.scrollX,
         documentScrollY: window.scrollY,
         openDetails: [...document.querySelectorAll('details[open][id]')].map((item) => item.id),
-        openInlineDrawers: captureOpenDrawerReferences(),
-        scrollPositions: captureScrollPositions(),
+        openInlineDrawers: captureOpenDrawerReferences(excludedTitles),
+        scrollPositions: captureScrollPositions(excludedTitles),
         focusedElementId: activeElement instanceof HTMLElement ? activeElement.id : '',
     };
 }
@@ -423,9 +438,10 @@ function restoreLateMountedUi(state) {
         clearLateRestoreWatchers();
         sessionStorage.removeItem(RESTART_STATE_KEY);
         const names = Array.isArray(state.updatedExtensions) ? state.updatedExtensions.join('、') : '';
+        const actionText = state.action === 'delete' ? '已删除' : '已更新';
         const message = fullyRestored
-            ? `${names || '扩展'} 已更新，输入内容和界面位置已恢复。`
-            : `${names || '扩展'} 已更新，输入内容已恢复；为避免打断操作，已停止继续调整迟到的界面位置。`;
+            ? `${names || '扩展'} ${actionText}，输入内容和界面位置已恢复。`
+            : `${names || '扩展'} ${actionText}，输入内容已恢复；为避免打断操作，已停止继续调整迟到的界面位置。`;
         notify('success', message, '无感重启完成');
     };
 
@@ -498,7 +514,7 @@ function scheduleRestartStateRestore() {
     restoreFallbackTimer = setTimeout(start, 15000);
 }
 
-function showRestartOverlay(updatedExtensions) {
+function showRestartOverlay(updatedExtensions, action = 'update') {
     document.getElementById(RESTART_OVERLAY_ID)?.remove();
     const overlay = document.createElement('div');
     overlay.id = RESTART_OVERLAY_ID;
@@ -507,7 +523,8 @@ function showRestartOverlay(updatedExtensions) {
     const spinner = document.createElement('i');
     spinner.className = 'fa-solid fa-arrows-rotate fa-spin';
     const title = document.createElement('strong');
-    title.textContent = '扩展已更新，正在无感重启…';
+    const actionText = action === 'delete' ? '删除' : '更新';
+    title.textContent = `扩展已${actionText}，正在无感重启…`;
     const detail = document.createElement('span');
     detail.textContent = `${updatedExtensions.filter(Boolean).join('、') || '目标扩展'} 的运行环境即将重新载入，输入内容和聊天位置会自动恢复。`;
     card.append(spinner, title, detail);
@@ -515,36 +532,36 @@ function showRestartOverlay(updatedExtensions) {
     document.body.append(overlay);
 }
 
-async function performSeamlessRestart(updatedExtensions) {
+async function performSeamlessRestart(updatedExtensions, action = 'update') {
     if (restartPending) return;
     restartPending = true;
     try {
-        const state = captureRestartState(updatedExtensions);
+        const state = captureRestartState(updatedExtensions, action);
         sessionStorage.setItem(RESTART_STATE_KEY, JSON.stringify(state));
     } catch (error) {
         console.warn(LOG_PREFIX, 'Could not save seamless restart state:', error);
         notify('warning', '无法保存完整界面状态，但仍会自动重新载入扩展。');
     }
-    showRestartOverlay(updatedExtensions);
+    showRestartOverlay(updatedExtensions, action);
     await new Promise((resolve) => setTimeout(resolve, 40));
     location.reload();
 }
 
-async function requestSeamlessRestart(updatedExtensions) {
+async function requestSeamlessRestart(updatedExtensions, action = 'update') {
     if (!settings.seamlessFallback || restartPending) return;
     if (!isGenerating()) {
-        await performSeamlessRestart(updatedExtensions);
+        await performSeamlessRestart(updatedExtensions, action);
         return;
     }
 
     restartPending = true;
-    notify('info', '检测到正在生成消息；更新已完成，将在生成结束后自动无感重启。');
+    notify('info', `检测到正在生成消息；扩展已${action === 'delete' ? '删除' : '更新'}，将在生成结束后自动无感重启。`);
     const resume = () => {
         eventSource.removeListener(event_types.GENERATION_ENDED, resume);
         eventSource.removeListener(event_types.GENERATION_STOPPED, resume);
         generationResumeHandler = null;
         restartPending = false;
-        void performSeamlessRestart(updatedExtensions);
+        void performSeamlessRestart(updatedExtensions, action);
     };
     generationResumeHandler = resume;
     eventSource.once(event_types.GENERATION_ENDED, resume);
@@ -609,6 +626,166 @@ async function updateRepository(externalId, isGlobal) {
         throw new Error(message || `Extension update failed (${response.status}).`);
     }
     return response.json();
+}
+
+async function deleteRepository(externalId, isGlobal) {
+    const response = await fetch('/api/extensions/delete', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ extensionName: externalId, global: isGlobal }),
+    });
+    if (!response.ok) {
+        const message = await response.text();
+        throw new Error(message || `Extension deletion failed (${response.status}).`);
+    }
+}
+
+function removeExtensionStyles(internalId, manifest) {
+    if (!manifest?.css) return;
+    const assetUrl = buildAssetUrl(internalId, manifest.css);
+    document.querySelectorAll('link[rel="stylesheet"][href]').forEach((link) => {
+        if (isSameAsset(link.href, assetUrl)) link.remove();
+    });
+}
+
+function removeManagerRows(externalId) {
+    document.querySelectorAll('.extension_block').forEach((block) => {
+        if (block.dataset.name === externalId) block.remove();
+    });
+}
+
+async function confirmAndDelete(rawId, button) {
+    let externalId;
+    try {
+        externalId = normalizeExternalId(rawId);
+    } catch (error) {
+        notify('error', error.message);
+        return;
+    }
+    if (deleting.has(externalId) || updating.has(externalId)) return;
+
+    const internalId = toInternalId(externalId);
+    const manifest = getManifest(internalId);
+    if (!manifest) {
+        notify('error', `找不到 ${externalId} 的 manifest。`);
+        return;
+    }
+
+    const displayName = manifest.display_name ?? externalId;
+    const hasCleanHook = typeof manifest?.hooks?.clean === 'string' && manifest.hooks.clean.length > 0;
+    const customInputs = hasCleanHook
+        ? [{ id: 'extension_delete_cleanup', label: '同时清理扩展保存的数据', defaultState: false }]
+        : null;
+    const popup = new Popup(`确定要删除 ${escapeHtml(displayName)} 吗？`, POPUP_TYPE.CONFIRM, '', { customInputs });
+    const confirmation = await popup.show();
+    if (confirmation !== POPUP_RESULT.AFFIRMATIVE) return;
+
+    const shouldClean = hasCleanHook && Boolean(popup.inputResults?.get('extension_delete_cleanup'));
+    const isDisabled = extension_settings.disabledExtensions?.includes(internalId) ?? false;
+    const isGlobal = resolveExtensionType(extensionTypes, externalId) === 'global';
+    let oldModule = null;
+    const hasDeleteHook = typeof manifest?.hooks?.delete === 'string' && manifest.hooks.delete.length > 0;
+    const needsHookModule = !isDisabled || hasDeleteHook || (shouldClean && hasCleanHook);
+    if (needsHookModule && manifest.js) {
+        try {
+            oldModule = await importExtensionModule(internalId, manifest);
+        } catch (error) {
+            console.warn(LOG_PREFIX, `Could not import ${externalId} before deletion:`, error);
+        }
+    }
+    const deletionHook = oldModule ? findDeletionHook(manifest, oldModule) : null;
+    const cleanupHook = oldModule ? findCleanupHook(manifest, oldModule) : null;
+    let runtimeDisposed = isDisabled || !manifest.js;
+    let disposalAttempted = false;
+    const hookContext = Object.freeze({
+        reason: 'extension-delete',
+        extensionName: internalId,
+        manifest: structuredClone(manifest),
+    });
+
+    let repositoryDeleted = false;
+    deleting.add(externalId);
+    button?.setAttribute('disabled', 'disabled');
+    button?.querySelector('i')?.classList.add('fa-spin');
+    try {
+        if (shouldClean && oldModule) {
+            try {
+                await invokeManifestHook(oldModule, manifest, 'clean', hookContext);
+            } catch (hookError) {
+                console.error(LOG_PREFIX, `Clean hook failed for ${externalId}:`, hookError);
+            }
+        }
+        let deletionHookSucceeded = false;
+        if (deletionHook) {
+            try {
+                await Promise.race([
+                    Promise.resolve(deletionHook.fn(hookContext)),
+                    new Promise((_, reject) => setTimeout(() => reject(new Error(`${deletionHook.name} hook timed out.`)), 5000)),
+                ]);
+                deletionHookSucceeded = true;
+            } catch (hookError) {
+                console.error(LOG_PREFIX, `Deletion hook failed for ${externalId}:`, hookError);
+            }
+        }
+        if (!runtimeDisposed && cleanupHook) {
+            disposalAttempted = true;
+            if (cleanupHook.fn === deletionHook?.fn && deletionHookSucceeded) {
+                runtimeDisposed = true;
+            } else {
+                try {
+                    await Promise.race([
+                        Promise.resolve(cleanupHook.fn(hookContext)),
+                        new Promise((_, reject) => setTimeout(() => reject(new Error(`${cleanupHook.name} hook timed out.`)), 5000)),
+                    ]);
+                    runtimeDisposed = true;
+                } catch (hookError) {
+                    console.error(LOG_PREFIX, `Runtime cleanup hook failed for ${externalId}:`, hookError);
+                }
+            }
+        }
+
+        await deleteRepository(externalId, isGlobal);
+        repositoryDeleted = true;
+        removeExtensionStyles(internalId, manifest);
+        removeManagerRows(externalId);
+        runtimeManifests.delete(internalId);
+        extension_settings.disabledExtensions = (extension_settings.disabledExtensions ?? []).filter((name) => name !== internalId);
+        await saveSettings();
+        await loadExtensionSettings({}, false, false);
+
+        if (runtimeDisposed) {
+            notify('success', `${displayName} 已删除，并已从当前页面卸载。`, '扩展删除完成');
+        } else if (settings.seamlessFallback) {
+            notify('warning', `${displayName} 已删除；旧脚本无法安全卸载，将自动无感重启。`, '扩展删除完成');
+            await requestSeamlessRestart([displayName], 'delete');
+        } else {
+            notify('warning', `${displayName} 已删除，但旧脚本会保留到下次刷新页面。`, '扩展删除完成');
+        }
+    } catch (error) {
+        console.error(LOG_PREFIX, `Failed to delete ${externalId}:`, error);
+        if (!repositoryDeleted && disposalAttempted && !isDisabled && oldModule) {
+            try {
+                await invokeManifestHook(oldModule, manifest, 'activate', { ...hookContext, reason: 'extension-delete-rollback' });
+            } catch (rollbackError) {
+                console.error(LOG_PREFIX, 'Deletion rollback failed:', rollbackError);
+            }
+        }
+        if (repositoryDeleted) {
+            const message = settings.seamlessFallback
+                ? `${displayName} 已删除，但页面状态同步失败，将通过无感重启完成清理。`
+                : `${displayName} 已删除，但页面状态同步失败；请稍后手动刷新一次。`;
+            notify('warning', message, '扩展删除完成');
+            if (settings.seamlessFallback) {
+                await requestSeamlessRestart([displayName], 'delete');
+            }
+        } else {
+            notify('error', `${displayName} 删除失败：${error.message}`, '扩展删除失败');
+        }
+    } finally {
+        deleting.delete(externalId);
+        button?.removeAttribute('disabled');
+        button?.querySelector('i')?.classList.remove('fa-spin');
+    }
 }
 
 async function replaceStyles(internalId, oldManifest, newManifest, token) {

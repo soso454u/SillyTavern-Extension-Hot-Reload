@@ -1,9 +1,3 @@
-#extension-hot-reload-settings .ehr-drawer-title {
-    align-items: center;
-    display: flex;
-    gap: 0.5rem;
-}
-
 .extension-hot-reload-all i {
     color: #ff8a3d;
 }

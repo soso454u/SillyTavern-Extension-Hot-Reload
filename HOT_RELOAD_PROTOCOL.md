@@ -25,7 +25,9 @@ SillyTavern Extension Hot Reload 支持一个很小的可选协议，让目标�
 2. `hooks.unload`；
 3. `hooks.disable`。
 
-不会调用 `clean` 或 `delete`。
+热更新过程中不会调用 `clean` 或 `delete`。
+
+删除扩展是独立流程：更新器会照常调用官方 `hooks.delete`，然后依次查找 `hot_reload`、`unload` 和 `disable` 来停止当前运行实例。`delete` 只表示“删除前执行”，不能单独证明脚本已从页面卸载。只有用户在删除确认框中主动勾选“同时清理扩展保存的数据”时，才会调用 `hooks.clean`。
 
 ## Hook context
 
