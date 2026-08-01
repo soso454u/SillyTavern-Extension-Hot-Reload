@@ -7,6 +7,7 @@ import {
     classifyScriptReload,
     findCleanupHook,
     isSameAsset,
+    normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
     toInternalId,
@@ -19,6 +20,12 @@ test('normalizes SillyTavern extension ids', () => {
     assert.equal(normalizeExternalId('third-party/Demo'), '/Demo');
     assert.equal(toInternalId('/Demo'), 'third-party/Demo');
     assert.throws(() => normalizeExternalId('../Demo'));
+});
+
+test('normalizes extension drawer titles for restart matching', () => {
+    assert.equal(normalizeDrawerTitle('  酒馆助手   New! '), '酒馆助手');
+    assert.equal(normalizeDrawerTitle('Selene 音乐播放器'), 'Selene 音乐播放器');
+    assert.equal(normalizeDrawerTitle('New Character Tools'), 'New Character Tools');
 });
 
 test('resolves local and global extension types', () => {

@@ -16,11 +16,12 @@ import {
     classifyScriptReload,
     findCleanupHook,
     isSameAsset,
+    normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.1.1';
+} from './lib/core.js?v=1.2.0';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
@@ -29,6 +30,8 @@ const BULK_BUTTON_CLASS = 'extension-hot-reload-all';
 const RESTART_OVERLAY_ID = 'extension-hot-reload-restart-overlay';
 const RESTART_STATE_KEY = 'extension-hot-reload:restart-state';
 const RESTART_STATE_MAX_AGE = 2 * 60 * 1000;
+const RESTART_STATE_VERSION = 2;
+const LATE_RESTORE_TIMEOUT = 6000;
 
 const DEFAULT_SETTINGS = Object.freeze({
     interceptUpdateButtons: true,
@@ -50,6 +53,9 @@ let settings = null;
 let compatibilityReadyListener = null;
 let restoreReadyHandler = null;
 let restoreFallbackTimer = null;
+let lateRestoreObserver = null;
+let lateRestoreTimer = null;
+let restoreInteractionHandler = null;
 let generationResumeHandler = null;
 let restartPending = false;
 
@@ -259,13 +265,44 @@ function findVisibleChatAnchor(chat) {
     };
 }
 
+function getDrawerTitle(drawer) {
+    const header = drawer.querySelector(':scope > .inline-drawer-header');
+    const title = header?.querySelector('b')?.textContent ?? header?.textContent ?? '';
+    return normalizeDrawerTitle(title);
+}
+
+function captureOpenDrawerReferences() {
+    const occurrences = new Map();
+    const references = [];
+    for (const drawer of document.querySelectorAll('.inline-drawer')) {
+        const title = getDrawerTitle(drawer);
+        const occurrence = occurrences.get(title) ?? 0;
+        occurrences.set(title, occurrence + 1);
+        const content = drawer.querySelector(':scope > .inline-drawer-content');
+        if (!(content instanceof HTMLElement) || getComputedStyle(content).display === 'none') continue;
+        if (!drawer.id && !title) continue;
+        references.push({ id: drawer.id || '', title, occurrence });
+    }
+    return references;
+}
+
+function captureScrollPositions() {
+    return [...document.querySelectorAll('[id]')]
+        .filter((element) => element instanceof HTMLElement
+            && element.id !== 'chat'
+            && (element.scrollTop !== 0 || element.scrollLeft !== 0)
+            && (element.scrollHeight > element.clientHeight || element.scrollWidth > element.clientWidth))
+        .slice(0, 50)
+        .map((element) => ({ id: element.id, top: element.scrollTop, left: element.scrollLeft }));
+}
+
 function captureRestartState(updatedExtensions) {
     const textarea = document.querySelector('#send_textarea');
     const chat = document.querySelector('#chat');
     const distanceFromBottom = chat ? chat.scrollHeight - chat.clientHeight - chat.scrollTop : 0;
     const activeElement = document.activeElement;
     return {
-        version: 1,
+        version: RESTART_STATE_VERSION,
         createdAt: Date.now(),
         path: `${location.pathname}${location.search}${location.hash}`,
         updatedExtensions: updatedExtensions.filter(Boolean).map(String),
@@ -278,12 +315,8 @@ function captureRestartState(updatedExtensions) {
         documentScrollX: window.scrollX,
         documentScrollY: window.scrollY,
         openDetails: [...document.querySelectorAll('details[open][id]')].map((item) => item.id),
-        openInlineDrawers: [...document.querySelectorAll('.inline-drawer[id]')]
-            .filter((drawer) => {
-                const content = drawer.querySelector(':scope > .inline-drawer-content');
-                return content instanceof HTMLElement && getComputedStyle(content).display !== 'none';
-            })
-            .map((drawer) => drawer.id),
+        openInlineDrawers: captureOpenDrawerReferences(),
+        scrollPositions: captureScrollPositions(),
         focusedElementId: activeElement instanceof HTMLElement ? activeElement.id : '',
     };
 }
@@ -294,7 +327,7 @@ function readRestartState() {
         if (!raw) return null;
         const state = JSON.parse(raw);
         const currentPath = `${location.pathname}${location.search}${location.hash}`;
-        if (!state || state.version !== 1 || state.path !== currentPath || Date.now() - state.createdAt > RESTART_STATE_MAX_AGE) {
+        if (!state || state.version !== RESTART_STATE_VERSION || state.path !== currentPath || Date.now() - state.createdAt > RESTART_STATE_MAX_AGE) {
             sessionStorage.removeItem(RESTART_STATE_KEY);
             return null;
         }
@@ -305,30 +338,36 @@ function readRestartState() {
     }
 }
 
-function restoreRestartState(state) {
+function resolveDrawer(reference) {
+    if (reference.id) {
+        const byId = document.getElementById(reference.id);
+        if (byId?.classList.contains('inline-drawer')) return byId;
+    }
+    if (!reference.title) return null;
+    const matches = [...document.querySelectorAll('.inline-drawer')]
+        .filter((drawer) => getDrawerTitle(drawer) === reference.title);
+    return matches[reference.occurrence ?? 0] ?? null;
+}
+
+function openInlineDrawer(drawer) {
+    const content = drawer.querySelector(':scope > .inline-drawer-content');
+    const icon = drawer.querySelector(':scope > .inline-drawer-header .inline-drawer-icon');
+    if (!(content instanceof HTMLElement)) return false;
+    content.style.display = 'block';
+    if (icon instanceof HTMLElement) {
+        icon.classList.remove('down', 'fa-circle-chevron-down');
+        icon.classList.add('up', 'fa-circle-chevron-up');
+    }
+    return true;
+}
+
+function restorePrimaryState(state) {
     const textarea = document.querySelector('#send_textarea');
     if (textarea instanceof HTMLTextAreaElement) {
         textarea.value = typeof state.draft === 'string' ? state.draft : '';
         textarea.dispatchEvent(new Event('input', { bubbles: true }));
         if (Number.isInteger(state.selectionStart) && Number.isInteger(state.selectionEnd)) {
             textarea.setSelectionRange(state.selectionStart, state.selectionEnd);
-        }
-    }
-
-    for (const id of state.openDetails ?? []) {
-        const details = document.getElementById(id);
-        if (details instanceof HTMLDetailsElement) details.open = true;
-    }
-
-    for (const id of state.openInlineDrawers ?? []) {
-        const drawer = document.getElementById(id);
-        if (!(drawer instanceof HTMLElement)) continue;
-        const content = drawer.querySelector(':scope > .inline-drawer-content');
-        const icon = drawer.querySelector(':scope > .inline-drawer-header .inline-drawer-icon');
-        if (content instanceof HTMLElement) content.style.display = 'block';
-        if (icon instanceof HTMLElement) {
-            icon.classList.remove('down', 'fa-circle-chevron-down');
-            icon.classList.add('up', 'fa-circle-chevron-up');
         }
     }
 
@@ -354,20 +393,95 @@ function restoreRestartState(state) {
     if (state.focusedElementId === 'send_textarea' && textarea instanceof HTMLTextAreaElement && !matchMedia('(pointer: coarse)').matches) {
         textarea.focus({ preventScroll: true });
     }
+}
 
-    sessionStorage.removeItem(RESTART_STATE_KEY);
-    const names = Array.isArray(state.updatedExtensions) ? state.updatedExtensions.join('、') : '';
-    notify('success', `${names || '扩展'} 已更新，输入内容和聊天位置已恢复。`, '无感重启完成');
+function clearLateRestoreWatchers() {
+    lateRestoreObserver?.disconnect();
+    lateRestoreObserver = null;
+    if (lateRestoreTimer) {
+        clearTimeout(lateRestoreTimer);
+        lateRestoreTimer = null;
+    }
+    if (restoreInteractionHandler) {
+        for (const eventName of ['pointerdown', 'wheel', 'touchstart', 'keydown']) {
+            document.removeEventListener(eventName, restoreInteractionHandler, true);
+        }
+        restoreInteractionHandler = null;
+    }
+}
+
+function restoreLateMountedUi(state) {
+    const pendingDetails = new Set(state.openDetails ?? []);
+    const pendingDrawers = [...(state.openInlineDrawers ?? [])];
+    const pendingScrolls = [...(state.scrollPositions ?? [])];
+    let completed = false;
+
+    const finish = () => {
+        if (completed) return;
+        completed = true;
+        const fullyRestored = pendingDetails.size === 0 && pendingDrawers.length === 0 && pendingScrolls.length === 0;
+        clearLateRestoreWatchers();
+        sessionStorage.removeItem(RESTART_STATE_KEY);
+        const names = Array.isArray(state.updatedExtensions) ? state.updatedExtensions.join('、') : '';
+        const message = fullyRestored
+            ? `${names || '扩展'} 已更新，输入内容和界面位置已恢复。`
+            : `${names || '扩展'} 已更新，输入内容已恢复；为避免打断操作，已停止继续调整迟到的界面位置。`;
+        notify('success', message, '无感重启完成');
+    };
+
+    const tryRestore = () => {
+        for (const id of [...pendingDetails]) {
+            const details = document.getElementById(id);
+            if (details instanceof HTMLDetailsElement) {
+                details.open = true;
+                pendingDetails.delete(id);
+            }
+        }
+        for (let index = pendingDrawers.length - 1; index >= 0; index--) {
+            const drawer = resolveDrawer(pendingDrawers[index]);
+            if (drawer && openInlineDrawer(drawer)) pendingDrawers.splice(index, 1);
+        }
+        for (let index = pendingScrolls.length - 1; index >= 0; index--) {
+            const position = pendingScrolls[index];
+            const element = document.getElementById(position.id);
+            if (!(element instanceof HTMLElement)) continue;
+            const canRestoreTop = element.scrollHeight - element.clientHeight + 2 >= position.top;
+            const canRestoreLeft = element.scrollWidth - element.clientWidth + 2 >= position.left;
+            if (!canRestoreTop || !canRestoreLeft) continue;
+            element.scrollTop = position.top;
+            element.scrollLeft = position.left;
+            pendingScrolls.splice(index, 1);
+        }
+        if (pendingDetails.size === 0 && pendingDrawers.length === 0 && pendingScrolls.length === 0) finish();
+    };
+
+    tryRestore();
+    if (completed) return;
+    lateRestoreObserver = new MutationObserver(tryRestore);
+    lateRestoreObserver.observe(document.body, { childList: true, subtree: true, attributes: true });
+    restoreInteractionHandler = finish;
+    for (const eventName of ['pointerdown', 'wheel', 'touchstart', 'keydown']) {
+        document.addEventListener(eventName, restoreInteractionHandler, true);
+    }
+    lateRestoreTimer = setTimeout(() => {
+        tryRestore();
+        finish();
+    }, LATE_RESTORE_TIMEOUT);
+}
+
+function beginRestartStateRestore(state) {
+    restorePrimaryState(state);
+    restoreLateMountedUi(state);
 }
 
 function scheduleRestartStateRestore() {
     const state = readRestartState();
     if (!state) return;
 
-    let restored = false;
-    const restore = () => {
-        if (restored) return;
-        restored = true;
+    let started = false;
+    const start = () => {
+        if (started) return;
+        started = true;
         if (restoreReadyHandler) {
             eventSource.removeListener(event_types.APP_READY, restoreReadyHandler);
             restoreReadyHandler = null;
@@ -376,12 +490,12 @@ function scheduleRestartStateRestore() {
             clearTimeout(restoreFallbackTimer);
             restoreFallbackTimer = null;
         }
-        requestAnimationFrame(() => setTimeout(() => restoreRestartState(state), 80));
+        requestAnimationFrame(() => beginRestartStateRestore(state));
     };
 
-    restoreReadyHandler = restore;
+    restoreReadyHandler = start;
     eventSource.once(event_types.APP_READY, restoreReadyHandler);
-    restoreFallbackTimer = setTimeout(restore, 5000);
+    restoreFallbackTimer = setTimeout(start, 15000);
 }
 
 function showRestartOverlay(updatedExtensions) {
@@ -412,7 +526,7 @@ async function performSeamlessRestart(updatedExtensions) {
         notify('warning', '无法保存完整界面状态，但仍会自动重新载入扩展。');
     }
     showRestartOverlay(updatedExtensions);
-    await new Promise((resolve) => setTimeout(resolve, 450));
+    await new Promise((resolve) => setTimeout(resolve, 40));
     location.reload();
 }
 
@@ -470,6 +584,18 @@ async function fetchFreshManifest(internalId, token) {
         throw new Error('The updated manifest is invalid.');
     }
     return manifest;
+}
+
+async function warmExtensionAssets(internalId, manifest) {
+    const files = [manifest?.js, manifest?.css].filter((file, index, list) => file && list.indexOf(file) === index);
+    await Promise.allSettled(files.map(async (file) => {
+        const response = await fetch(buildAssetUrl(internalId, file), {
+            cache: 'reload',
+            credentials: 'same-origin',
+        });
+        if (!response.ok) throw new Error(`Could not warm ${file} (${response.status}).`);
+        await response.arrayBuffer();
+    }));
 }
 
 async function updateRepository(externalId, isGlobal) {
@@ -581,6 +707,9 @@ async function updateOne(rawId, button = null, options = {}) {
             previousManifest: structuredClone(oldManifest),
             manifest: structuredClone(newManifest),
         });
+        const assetWarmup = !isDisabled && policy.needsPageReload
+            ? warmExtensionAssets(internalId, newManifest)
+            : Promise.resolve();
 
         let scriptReloaded = false;
         let styleReloaded = false;
@@ -617,6 +746,8 @@ async function updateOne(rawId, button = null, options = {}) {
                 console.error(LOG_PREFIX, 'Stylesheet hot replacement failed:', styleError);
             }
         }
+
+        await assetWarmup;
 
         runtimeManifests.set(internalId, newManifest);
         updateManagerRow(externalId, newManifest, result.shortCommitHash);
@@ -706,6 +837,7 @@ function teardown() {
         clearTimeout(restoreFallbackTimer);
         restoreFallbackTimer = null;
     }
+    clearLateRestoreWatchers();
     if (generationResumeHandler) {
         eventSource.removeListener(event_types.GENERATION_ENDED, generationResumeHandler);
         eventSource.removeListener(event_types.GENERATION_STOPPED, generationResumeHandler);
