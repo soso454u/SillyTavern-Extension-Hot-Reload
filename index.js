@@ -20,13 +20,14 @@ import {
     classifyScriptReload,
     findCleanupHook,
     findDeletionHook,
+    findLocalModuleDependencies,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.3.0';
+} from './lib/core.js?v=1.3.1';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
@@ -603,6 +604,43 @@ async function fetchFreshManifest(internalId, token) {
     return manifest;
 }
 
+async function evictExtensionAssetCaches(internalId) {
+    if (!('caches' in globalThis)) return 0;
+    const manifestPath = new URL(buildAssetUrl(internalId, 'manifest.json'), location.origin).pathname;
+    const extensionPrefix = manifestPath.slice(0, -'manifest.json'.length);
+    let deleted = 0;
+
+    try {
+        for (const cacheName of await caches.keys()) {
+            const cache = await caches.open(cacheName);
+            for (const request of await cache.keys()) {
+                const url = new URL(request.url);
+                if (url.origin === location.origin && url.pathname.startsWith(extensionPrefix)) {
+                    if (await cache.delete(request)) deleted++;
+                }
+            }
+        }
+    } catch (error) {
+        console.warn(LOG_PREFIX, `Could not clear cached assets for ${internalId}:`, error);
+    }
+    log('Evicted cached extension assets', { internalId, deleted });
+    return deleted;
+}
+
+async function inspectLocalModuleDependencies(internalId, manifest, token) {
+    if (!manifest?.js) return [];
+    const entryUrl = new URL(withCacheBuster(buildAssetUrl(internalId, manifest.js), token), location.origin);
+    const manifestUrl = new URL(buildAssetUrl(internalId, 'manifest.json'), location.origin);
+    const response = await fetch(entryUrl, {
+        cache: 'no-store',
+        credentials: 'same-origin',
+    });
+    if (!response.ok) {
+        throw new Error(`Could not inspect extension entry (${response.status}).`);
+    }
+    return findLocalModuleDependencies(await response.text(), entryUrl, new URL('./', manifestUrl));
+}
+
 async function warmExtensionAssets(internalId, manifest) {
     const files = [manifest?.js, manifest?.css].filter((file, index, list) => file && list.indexOf(file) === index);
     await Promise.allSettled(files.map(async (file) => {
@@ -874,9 +912,22 @@ async function updateOne(rawId, button = null, options = {}) {
         }
 
         const token = `${result.shortCommitHash ?? 'updated'}-${Date.now()}`;
+        await evictExtensionAssetCaches(internalId);
         const newManifest = await fetchFreshManifest(internalId, token);
         if (!isDisabled && !oldManifest.js && newManifest.js) {
             policy = { reloadScript: true, needsPageReload: false, reason: 'new-script' };
+        }
+        if (!isDisabled && policy.reloadScript) {
+            try {
+                const localDependencies = await inspectLocalModuleDependencies(internalId, newManifest, token);
+                if (localDependencies.length > 0) {
+                    policy = { reloadScript: false, needsPageReload: true, reason: 'multi-file-module' };
+                    log('Local module dependencies require a seamless restart', { externalId, localDependencies });
+                }
+            } catch (inspectionError) {
+                console.warn(LOG_PREFIX, `Could not inspect module dependencies for ${externalId}:`, inspectionError);
+                policy = { reloadScript: false, needsPageReload: true, reason: 'module-inspection-failed' };
+            }
         }
         const hookContext = Object.freeze({
             reason: 'hot-update',
@@ -912,7 +963,7 @@ async function updateOne(rawId, button = null, options = {}) {
                 }
                 throw error;
             }
-        } else if (oldModule) {
+        } else if (oldModule && !policy.needsPageReload) {
             await invokeManifestHook(oldModule, oldManifest, 'update', hookContext);
         }
 
@@ -942,9 +993,14 @@ async function updateOne(rawId, button = null, options = {}) {
             message = `${newManifest.display_name ?? externalId} 已更新${styleReloaded ? '，样式已立即生效' : ''}。`;
         } else {
             status = 'needs-page-reload';
+            const reloadReason = policy.reason === 'multi-file-module'
+                ? '检测到本地子模块，为避免浏览器复用旧模块缓存'
+                : policy.reason === 'module-inspection-failed'
+                    ? '无法确认本地子模块是否全部换新'
+                    : '脚本没有清理钩子';
             message = settings.seamlessFallback
-                ? `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；脚本没有清理钩子，将自动无感重启以安全应用。`
-                : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新，但脚本没有清理钩子；为避免重复监听，本次未强制重载脚本。`;
+                ? `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，将自动无感重启以安全应用。`
+                : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，请稍后刷新页面。`;
         }
         if (!options.quiet) {
             notify(status === 'needs-page-reload' ? 'warning' : 'success', message);

@@ -7,6 +7,7 @@ import {
     classifyScriptReload,
     findCleanupHook,
     findDeletionHook,
+    findLocalModuleDependencies,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
@@ -46,6 +47,21 @@ test('builds encoded same-origin asset URLs and rejects traversal', () => {
 
 test('adds a deterministic cache-busting parameter', () => {
     assert.equal(withCacheBuster('/x.js?lang=zh', 'abc'), '/x.js?lang=zh&st_hot_reload=abc');
+});
+
+test('detects local static, re-exported, and dynamic module dependencies', () => {
+    const source = `
+        import '../../../extensions.js';
+        import { helper } from './lib/helper.js?v=2';
+        export { value } from './feature.js';
+        const lazy = import('/scripts/extensions/third-party/Demo/lazy.js');
+        const packageModule = import('some-package');
+    `;
+    assert.deepEqual(findLocalModuleDependencies(
+        source,
+        'http://localhost/scripts/extensions/third-party/Demo/index.js?hot=1',
+        'http://localhost/scripts/extensions/third-party/Demo/',
+    ), ['./lib/helper.js?v=2', './feature.js', '/scripts/extensions/third-party/Demo/lazy.js']);
 });
 
 test('finds explicit cleanup hooks before official disable hooks', () => {
