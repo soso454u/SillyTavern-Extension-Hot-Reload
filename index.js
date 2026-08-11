@@ -21,13 +21,14 @@ import {
     findCleanupHook,
     findDeletionHook,
     findLocalModuleDependencies,
+    findManifestStructureChanges,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.3.1';
+} from './lib/core.js?v=1.4.0';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
@@ -38,6 +39,10 @@ const RESTART_STATE_KEY = 'extension-hot-reload:restart-state';
 const RESTART_STATE_MAX_AGE = 2 * 60 * 1000;
 const RESTART_STATE_VERSION = 3;
 const LATE_RESTORE_TIMEOUT = 6000;
+const REPOSITORY_REQUEST_TIMEOUT = 120000;
+const ASSET_REQUEST_TIMEOUT = 15000;
+const ASSET_WARMUP_BUDGET = 1250;
+const MANAGER_UI_SELECTOR = '.extensions_info, .extensions_toolbar, #extensions_settings2, #extensions_settings, #extensions_settings_block';
 
 const DEFAULT_SETTINGS = Object.freeze({
     interceptUpdateButtons: true,
@@ -58,11 +63,13 @@ const deleting = new Set();
 
 let initialized = false;
 let managerObserver = null;
+let managerUiFrame = null;
 let settings = null;
 let compatibilityReadyListener = null;
 let restoreReadyHandler = null;
 let restoreFallbackTimer = null;
 let lateRestoreObserver = null;
+let lateRestoreFrame = null;
 let lateRestoreTimer = null;
 let restoreInteractionHandler = null;
 let generationResumeHandler = null;
@@ -241,8 +248,12 @@ function findActionButton(event, selector) {
 }
 
 function captureUpdateClick(event) {
-    const updateButton = settings?.interceptUpdateButtons ? findActionButton(event, '.btn_update') : null;
-    const deleteButton = settings?.interceptDeleteButtons ? findActionButton(event, '.btn_delete') : null;
+    const updateButton = settings?.interceptUpdateButtons
+        ? findActionButton(event, '.extensions_info .extension_block .btn_update')
+        : null;
+    const deleteButton = settings?.interceptDeleteButtons
+        ? findActionButton(event, '.extensions_info .extension_block .btn_delete')
+        : null;
     const button = updateButton ?? deleteButton;
     if (!button || button.classList.contains('displayNone')) return;
 
@@ -414,6 +425,10 @@ function restorePrimaryState(state) {
 function clearLateRestoreWatchers() {
     lateRestoreObserver?.disconnect();
     lateRestoreObserver = null;
+    if (lateRestoreFrame !== null) {
+        cancelAnimationFrame(lateRestoreFrame);
+        lateRestoreFrame = null;
+    }
     if (lateRestoreTimer) {
         clearTimeout(lateRestoreTimer);
         lateRestoreTimer = null;
@@ -472,10 +487,34 @@ function restoreLateMountedUi(state) {
         if (pendingDetails.size === 0 && pendingDrawers.length === 0 && pendingScrolls.length === 0) finish();
     };
 
+    const mutationMayHelp = (mutation) => {
+        if (mutation.type !== 'childList' || mutation.addedNodes.length === 0) return false;
+        const target = mutation.target instanceof Element ? mutation.target : null;
+        if (target && pendingScrolls.some(({ id }) => target.id === id || target.closest(`#${CSS.escape(id)}`))) {
+            return true;
+        }
+        if (target?.closest('.inline-drawer') && pendingDrawers.length > 0) return true;
+        return [...mutation.addedNodes].some((node) => {
+            if (!(node instanceof Element)) return false;
+            if (pendingDetails.has(node.id) || pendingScrolls.some(({ id }) => node.id === id)) return true;
+            if (pendingDrawers.length > 0 && (node.matches('.inline-drawer') || node.querySelector('.inline-drawer'))) return true;
+            return [...pendingDetails].some((id) => node.querySelector(`#${CSS.escape(id)}`))
+                || pendingScrolls.some(({ id }) => node.querySelector(`#${CSS.escape(id)}`));
+        });
+    };
+
+    const scheduleRestore = (mutations) => {
+        if (lateRestoreFrame !== null || !mutations.some(mutationMayHelp)) return;
+        lateRestoreFrame = requestAnimationFrame(() => {
+            lateRestoreFrame = null;
+            tryRestore();
+        });
+    };
+
     tryRestore();
     if (completed) return;
-    lateRestoreObserver = new MutationObserver(tryRestore);
-    lateRestoreObserver.observe(document.body, { childList: true, subtree: true, attributes: true });
+    lateRestoreObserver = new MutationObserver(scheduleRestore);
+    lateRestoreObserver.observe(document.body, { childList: true, subtree: true });
     restoreInteractionHandler = finish;
     for (const eventName of ['pointerdown', 'wheel', 'touchstart', 'keydown']) {
         document.addEventListener(eventName, restoreInteractionHandler, true);
@@ -575,7 +614,15 @@ async function importExtensionModule(internalId, manifest, token = '') {
     }
     const baseUrl = buildAssetUrl(internalId, manifest.js);
     const url = token ? withCacheBuster(baseUrl, token) : baseUrl;
-    return import(url);
+    return promiseWithTimeout(import(url), ASSET_REQUEST_TIMEOUT, 'Extension module import timed out.');
+}
+
+function promiseWithTimeout(promise, milliseconds, message) {
+    let timer;
+    const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error(message)), milliseconds);
+    });
+    return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
 }
 
 async function invokeManifestHook(moduleNamespace, manifest, hookName, context) {
@@ -584,16 +631,25 @@ async function invokeManifestHook(moduleNamespace, manifest, hookName, context) 
     if (typeof fn !== 'function') {
         return false;
     }
-    await Promise.race([
-        Promise.resolve(fn(context)),
-        new Promise((_, reject) => setTimeout(() => reject(new Error(`${hookName} hook timed out.`)), 5000)),
-    ]);
+    await promiseWithTimeout(Promise.resolve(fn(context)), 5000, `${hookName} hook timed out.`);
     return true;
+}
+
+function timeoutSignal(milliseconds) {
+    if (typeof AbortSignal.timeout === 'function') {
+        return AbortSignal.timeout(milliseconds);
+    }
+    const controller = new AbortController();
+    setTimeout(() => controller.abort(), milliseconds);
+    return controller.signal;
 }
 
 async function fetchFreshManifest(internalId, token) {
     const url = withCacheBuster(buildAssetUrl(internalId, 'manifest.json'), token);
-    const response = await fetch(url, { cache: 'no-store' });
+    const response = await fetch(url, {
+        cache: 'no-store',
+        signal: timeoutSignal(ASSET_REQUEST_TIMEOUT),
+    });
     if (!response.ok) {
         throw new Error(`Could not load the updated manifest (${response.status}).`);
     }
@@ -611,15 +667,16 @@ async function evictExtensionAssetCaches(internalId) {
     let deleted = 0;
 
     try {
-        for (const cacheName of await caches.keys()) {
+        const cacheResults = await Promise.all((await caches.keys()).map(async (cacheName) => {
             const cache = await caches.open(cacheName);
-            for (const request of await cache.keys()) {
+            const matches = (await cache.keys()).filter((request) => {
                 const url = new URL(request.url);
-                if (url.origin === location.origin && url.pathname.startsWith(extensionPrefix)) {
-                    if (await cache.delete(request)) deleted++;
-                }
-            }
-        }
+                return url.origin === location.origin && url.pathname.startsWith(extensionPrefix);
+            });
+            const results = await Promise.allSettled(matches.map((request) => cache.delete(request)));
+            return results.filter((result) => result.status === 'fulfilled' && result.value).length;
+        }));
+        deleted = cacheResults.reduce((total, count) => total + count, 0);
     } catch (error) {
         console.warn(LOG_PREFIX, `Could not clear cached assets for ${internalId}:`, error);
     }
@@ -634,6 +691,7 @@ async function inspectLocalModuleDependencies(internalId, manifest, token) {
     const response = await fetch(entryUrl, {
         cache: 'no-store',
         credentials: 'same-origin',
+        signal: timeoutSignal(ASSET_REQUEST_TIMEOUT),
     });
     if (!response.ok) {
         throw new Error(`Could not inspect extension entry (${response.status}).`);
@@ -643,14 +701,27 @@ async function inspectLocalModuleDependencies(internalId, manifest, token) {
 
 async function warmExtensionAssets(internalId, manifest) {
     const files = [manifest?.js, manifest?.css].filter((file, index, list) => file && list.indexOf(file) === index);
-    await Promise.allSettled(files.map(async (file) => {
+    if (files.length === 0) return;
+    const controller = new AbortController();
+    let budgetTimer;
+    const warmup = Promise.allSettled(files.map(async (file) => {
         const response = await fetch(buildAssetUrl(internalId, file), {
             cache: 'reload',
             credentials: 'same-origin',
+            signal: controller.signal,
         });
         if (!response.ok) throw new Error(`Could not warm ${file} (${response.status}).`);
         await response.arrayBuffer();
     }));
+    const budget = new Promise((resolve) => {
+        budgetTimer = setTimeout(() => {
+            controller.abort();
+            resolve('budget-exhausted');
+        }, ASSET_WARMUP_BUDGET);
+    });
+    const outcome = await Promise.race([warmup.then(() => 'complete'), budget]);
+    if (outcome === 'complete') clearTimeout(budgetTimer);
+    log('Extension asset warmup finished', { internalId, outcome });
 }
 
 async function updateRepository(externalId, isGlobal) {
@@ -658,6 +729,7 @@ async function updateRepository(externalId, isGlobal) {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify({ extensionName: externalId, global: isGlobal }),
+        signal: timeoutSignal(REPOSITORY_REQUEST_TIMEOUT),
     });
     if (!response.ok) {
         const message = await response.text();
@@ -671,6 +743,7 @@ async function deleteRepository(externalId, isGlobal) {
         method: 'POST',
         headers: getRequestHeaders(),
         body: JSON.stringify({ extensionName: externalId, global: isGlobal }),
+        signal: timeoutSignal(REPOSITORY_REQUEST_TIMEOUT),
     });
     if (!response.ok) {
         const message = await response.text();
@@ -756,10 +829,11 @@ async function confirmAndDelete(rawId, button) {
         let deletionHookSucceeded = false;
         if (deletionHook) {
             try {
-                await Promise.race([
+                await promiseWithTimeout(
                     Promise.resolve(deletionHook.fn(hookContext)),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error(`${deletionHook.name} hook timed out.`)), 5000)),
-                ]);
+                    5000,
+                    `${deletionHook.name} hook timed out.`,
+                );
                 deletionHookSucceeded = true;
             } catch (hookError) {
                 console.error(LOG_PREFIX, `Deletion hook failed for ${externalId}:`, hookError);
@@ -771,10 +845,11 @@ async function confirmAndDelete(rawId, button) {
                 runtimeDisposed = true;
             } else {
                 try {
-                    await Promise.race([
+                    await promiseWithTimeout(
                         Promise.resolve(cleanupHook.fn(hookContext)),
-                        new Promise((_, reject) => setTimeout(() => reject(new Error(`${cleanupHook.name} hook timed out.`)), 5000)),
-                    ]);
+                        5000,
+                        `${cleanupHook.name} hook timed out.`,
+                    );
                     runtimeDisposed = true;
                 } catch (hookError) {
                     console.error(LOG_PREFIX, `Runtime cleanup hook failed for ${externalId}:`, hookError);
@@ -842,11 +917,16 @@ async function replaceStyles(internalId, oldManifest, newManifest, token) {
     link.type = 'text/css';
     link.dataset.extensionHotReload = internalId;
     link.href = withCacheBuster(newUrl, token);
-    await new Promise((resolve, reject) => {
-        link.addEventListener('load', resolve, { once: true });
-        link.addEventListener('error', () => reject(new Error('Updated stylesheet failed to load.')), { once: true });
-        document.head.append(link);
-    });
+    try {
+        await promiseWithTimeout(new Promise((resolve, reject) => {
+            link.addEventListener('load', resolve, { once: true });
+            link.addEventListener('error', () => reject(new Error('Updated stylesheet failed to load.')), { once: true });
+            document.head.append(link);
+        }), ASSET_REQUEST_TIMEOUT, 'Updated stylesheet load timed out.');
+    } catch (error) {
+        link.remove();
+        throw error;
+    }
     oldLinks.forEach((oldLink) => oldLink.remove());
     return true;
 }
@@ -889,6 +969,11 @@ async function updateOne(rawId, button = null, options = {}) {
     button?.setAttribute('disabled', 'disabled');
     button?.querySelector('i')?.classList.add('fa-spin');
 
+    let repositoryUpdated = false;
+    let runtimeTouched = false;
+    let result = null;
+    let newManifest = null;
+
     try {
         const isGlobal = resolveExtensionType(extensionTypes, externalId) === 'global';
         const isDisabled = extension_settings.disabledExtensions?.includes(internalId) ?? false;
@@ -904,18 +989,21 @@ async function updateOne(rawId, button = null, options = {}) {
         });
 
         log('Updating', { externalId, isGlobal, policy, cleanupHook: cleanupHook?.name });
-        const result = await updateRepository(externalId, isGlobal);
+        result = await updateRepository(externalId, isGlobal);
         if (result.isUpToDate) {
             if (!options.quiet) notify('success', `${oldManifest.display_name ?? externalId} 已经是最新版本。`);
             updateManagerRow(externalId, oldManifest, result.shortCommitHash);
             return { status: 'up-to-date', result, displayName: oldManifest.display_name ?? externalId };
         }
+        repositoryUpdated = true;
 
         const token = `${result.shortCommitHash ?? 'updated'}-${Date.now()}`;
         await evictExtensionAssetCaches(internalId);
-        const newManifest = await fetchFreshManifest(internalId, token);
-        if (!isDisabled && !oldManifest.js && newManifest.js) {
-            policy = { reloadScript: true, needsPageReload: false, reason: 'new-script' };
+        newManifest = await fetchFreshManifest(internalId, token);
+        const manifestStructureChanges = findManifestStructureChanges(oldManifest, newManifest);
+        if (manifestStructureChanges.length > 0) {
+            policy = { reloadScript: false, needsPageReload: true, reason: 'manifest-structure-changed' };
+            log('Manifest structure changes require a seamless restart', { externalId, manifestStructureChanges });
         }
         if (!isDisabled && policy.reloadScript) {
             try {
@@ -943,12 +1031,15 @@ async function updateOne(rawId, button = null, options = {}) {
         let styleReloaded = false;
         if (policy.reloadScript) {
             if (cleanupHook) {
-                await Promise.race([
+                runtimeTouched = true;
+                await promiseWithTimeout(
                     Promise.resolve(cleanupHook.fn(hookContext)),
-                    new Promise((_, reject) => setTimeout(() => reject(new Error(`${cleanupHook.name} hook timed out.`)), 5000)),
-                ]);
+                    5000,
+                    `${cleanupHook.name} hook timed out.`,
+                );
             }
             try {
+                runtimeTouched = true;
                 const newModule = await importExtensionModule(internalId, newManifest, token);
                 await invokeManifestHook(newModule, newManifest, 'update', hookContext);
                 await invokeManifestHook(newModule, newManifest, 'activate', hookContext);
@@ -964,6 +1055,7 @@ async function updateOne(rawId, button = null, options = {}) {
                 throw error;
             }
         } else if (oldModule && !policy.needsPageReload) {
+            runtimeTouched = true;
             await invokeManifestHook(oldModule, oldManifest, 'update', hookContext);
         }
 
@@ -982,7 +1074,19 @@ async function updateOne(rawId, button = null, options = {}) {
 
         let status = 'files-updated';
         let message;
-        if (isDisabled) {
+        if (policy.needsPageReload) {
+            status = 'needs-page-reload';
+            const reloadReason = policy.reason === 'multi-file-module'
+                ? '检测到本地子模块，为避免浏览器复用旧模块缓存'
+                : policy.reason === 'module-inspection-failed'
+                    ? '无法确认本地子模块是否全部换新'
+                    : policy.reason === 'manifest-structure-changed'
+                        ? 'manifest 运行结构已变化，需要让 SillyTavern 重建扩展状态'
+                        : '脚本没有清理钩子';
+            message = settings.seamlessFallback
+                ? `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，将自动无感重启以安全应用。`
+                : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，请稍后刷新页面。`;
+        } else if (isDisabled) {
             status = 'updated-disabled';
             message = `${newManifest.display_name ?? externalId} 已更新；它当前未启用，不需要重载运行中的脚本。`;
         } else if (scriptReloaded) {
@@ -992,15 +1096,7 @@ async function updateOne(rawId, button = null, options = {}) {
             status = 'style-reloaded';
             message = `${newManifest.display_name ?? externalId} 已更新${styleReloaded ? '，样式已立即生效' : ''}。`;
         } else {
-            status = 'needs-page-reload';
-            const reloadReason = policy.reason === 'multi-file-module'
-                ? '检测到本地子模块，为避免浏览器复用旧模块缓存'
-                : policy.reason === 'module-inspection-failed'
-                    ? '无法确认本地子模块是否全部换新'
-                    : '脚本没有清理钩子';
-            message = settings.seamlessFallback
-                ? `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，将自动无感重启以安全应用。`
-                : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，请稍后刷新页面。`;
+            message = `${newManifest.display_name ?? externalId} 的文件已更新。`;
         }
         if (!options.quiet) {
             notify(status === 'needs-page-reload' ? 'warning' : 'success', message);
@@ -1008,6 +1104,27 @@ async function updateOne(rawId, button = null, options = {}) {
         return { status, result, message, displayName: newManifest.display_name ?? externalId };
     } catch (error) {
         console.error(LOG_PREFIX, `Failed to update ${externalId}:`, error);
+        if (repositoryUpdated) {
+            const displayName = newManifest?.display_name ?? oldManifest.display_name ?? externalId;
+            if (newManifest) {
+                runtimeManifests.set(internalId, newManifest);
+                updateManagerRow(externalId, newManifest, result?.shortCommitHash);
+            }
+            const recovery = settings.seamlessFallback
+                ? '热载入未能安全完成，已自动切换无感重启恢复干净运行环境。'
+                : '热载入未能安全完成，请刷新页面以恢复干净运行环境。';
+            const message = `${displayName} 的 Git 更新已完成；${recovery}`;
+            log('Post-update failure requires a clean runtime', { externalId, runtimeTouched, error });
+            if (!options.quiet) notify('warning', message);
+            return {
+                status: 'needs-page-reload',
+                result,
+                error,
+                message,
+                displayName,
+                recoveryReason: runtimeTouched ? 'runtime-touched' : 'post-update-failure',
+            };
+        }
         if (!options.quiet) notify('error', `${externalId} 更新失败：${error.message}`);
         return { status: 'failed', error };
     } finally {
@@ -1019,7 +1136,7 @@ async function updateOne(rawId, button = null, options = {}) {
 
 async function updateAllVisible(button) {
     if (button.disabled) return;
-    const targets = [...document.querySelectorAll('.extension_block .btn_update:not(.displayNone)')]
+    const targets = [...document.querySelectorAll('.extensions_info .extension_block .btn_update:not(.displayNone)')]
         .map((item) => item.dataset.name)
         .filter(Boolean);
     if (!targets.length) {
@@ -1049,9 +1166,26 @@ async function updateAllVisible(button) {
     }
 }
 
+function scheduleEnsureUi() {
+    if (managerUiFrame !== null) return;
+    managerUiFrame = requestAnimationFrame(() => {
+        managerUiFrame = null;
+        ensureUi();
+    });
+}
+
+function mutationContainsManagerUi(mutation) {
+    if (mutation.type !== 'childList') return false;
+    if (mutation.target instanceof Element && mutation.target.matches(MANAGER_UI_SELECTOR)) return true;
+    return [...mutation.addedNodes].some((node) => node instanceof Element
+        && (node.matches(MANAGER_UI_SELECTOR) || node.querySelector(MANAGER_UI_SELECTOR)));
+}
+
 function startObserver() {
     managerObserver?.disconnect();
-    managerObserver = new MutationObserver(() => ensureUi());
+    managerObserver = new MutationObserver((mutations) => {
+        if (mutations.some(mutationContainsManagerUi)) scheduleEnsureUi();
+    });
     managerObserver.observe(document.body, { childList: true, subtree: true });
     ensureUi();
 }
@@ -1078,6 +1212,10 @@ function teardown() {
     }
     managerObserver?.disconnect();
     managerObserver = null;
+    if (managerUiFrame !== null) {
+        cancelAnimationFrame(managerUiFrame);
+        managerUiFrame = null;
+    }
     document.getElementById(ROOT_ID)?.remove();
     document.getElementById(RESTART_OVERLAY_ID)?.remove();
     document.querySelectorAll(`.${BULK_BUTTON_CLASS}`).forEach((button) => button.remove());

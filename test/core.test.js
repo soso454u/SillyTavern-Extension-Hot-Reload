@@ -8,6 +8,7 @@ import {
     findCleanupHook,
     findDeletionHook,
     findLocalModuleDependencies,
+    findManifestStructureChanges,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
@@ -62,6 +63,41 @@ test('detects local static, re-exported, and dynamic module dependencies', () =>
         'http://localhost/scripts/extensions/third-party/Demo/index.js?hot=1',
         'http://localhost/scripts/extensions/third-party/Demo/',
     ), ['./lib/helper.js?v=2', './feature.js', '/scripts/extensions/third-party/Demo/lazy.js']);
+});
+
+test('detects local URL and worker runtime resources', () => {
+    const source = `
+        const workerUrl = new URL('./worker.js', import.meta.url);
+        const worker = new Worker('./direct-worker.js', { type: 'module' });
+        const shared = new SharedWorker('/scripts/extensions/third-party/Demo/shared.js');
+        const remote = new Worker('https://example.com/remote.js');
+    `;
+    assert.deepEqual(findLocalModuleDependencies(
+        source,
+        'http://localhost/scripts/extensions/third-party/Demo/index.js',
+        'http://localhost/scripts/extensions/third-party/Demo/',
+    ), ['./worker.js', './direct-worker.js', '/scripts/extensions/third-party/Demo/shared.js']);
+});
+
+test('detects lifecycle manifest changes but ignores cosmetic metadata', () => {
+    const previous = {
+        display_name: 'Demo',
+        version: '1.0.0',
+        js: 'index.js',
+        hooks: { activate: 'activate', disable: 'disable' },
+        requires: ['vectors'],
+    };
+    assert.deepEqual(findManifestStructureChanges(previous, {
+        ...previous,
+        display_name: 'Demo renamed',
+        version: '1.1.0',
+        hooks: { disable: 'disable', activate: 'activate' },
+    }), []);
+    assert.deepEqual(findManifestStructureChanges(previous, {
+        ...previous,
+        js: 'dist/index.js',
+        requires: ['vectors', 'chromadb'],
+    }), ['js', 'requires']);
 });
 
 test('finds explicit cleanup hooks before official disable hooks', () => {
