@@ -1,5 +1,16 @@
 # Changelog
 
+## 1.5.0 - 2026-08-12
+
+- 新增 Runtime Supervisor，在其他第三方扩展启动前安装保守的可逆资源追踪层。
+- 通过调用栈与回调上下文归属 SillyTavern 事件、DOM/jQuery 监听器、计时器、animation frame、Observer、未完成的 fetch、Worker/Socket 和新插入 DOM 节点。
+- 无 cleanup hook 的扩展在追踪完整、资源账本非空、无不透明操作且新旧入口风险审计均通过时，可自动托管清理并原地换新。
+- 新增全局赋值、Prototype 修改、既有 DOM 修改、动态代码、外部注册表与特殊媒体运行时风险扫描；无法证明安全时继续无感重启。
+- 支持 `extension_hot_reload.self_managed_modules` 声明，允许扩展在自行换新全部本地模块和资源 URL 时绕过通用多文件缓存保护。
+- 保留 Native cleanup 最高优先级、manifest 结构保护、模块缓存保护和 Git 后失败自动无感重启；不 patch `Promise.prototype`。
+- 将 `loading_order` 提前到 `-1000000`，确保完整覆盖后续常规扩展的初始化阶段。
+- 新增 Supervisor 单元测试，并同步升级 manifest、包版本和内部模块令牌到 `1.5.0`。
+
 ## 1.4.0 - 2026-08-12
 
 - 将扩展管理器的全局 DOM 观察收紧为相关节点过滤，并通过 `requestAnimationFrame` 合并 UI 修复。

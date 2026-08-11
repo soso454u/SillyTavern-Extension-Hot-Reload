@@ -112,6 +112,28 @@ import { start } from './runtime.js?v=1.4.0';
 
 如果依赖图没有版本变化，热更新后可能出现“入口是新版、内部模块仍是旧版”的混合状态。
 
+### Self-managed local modules
+
+如果扩展保证每次发布都会为所有本地子模块、Worker 和运行资源生成新 URL，可以显式允许原地热载入：
+
+```json
+{
+  "extension_hot_reload": {
+    "self_managed_modules": true
+  },
+  "hooks": {
+    "activate": "onActivate",
+    "hot_reload": "onHotUnload"
+  }
+}
+```
+
+该声明是扩展作者对模块版本一致性的承诺，不会代替 cleanup hook 或 Runtime Supervisor。如果任何本地导入仍使用稳定旧 URL，不应开启此声明。
+
+## Managed runtime fallback
+
+1.5.0 起，没有 cleanup hook 的常规扩展可在 Runtime Supervisor 完整覆盖、可逆资源账本非空、新旧入口风险审计均通过时自动热载入。这是保守的兼容路径，不会覆盖扩展自带的 hook，也不会将静态扫描宣传为 100% 证明。
+
 ## Error handling
 
 - 每个生命周期 hook 最多等待 5 秒；

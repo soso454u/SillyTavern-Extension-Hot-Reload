@@ -21,14 +21,17 @@ import {
     findCleanupHook,
     findDeletionHook,
     findLocalModuleDependencies,
+    findManagedRuntimeRisks,
     findManifestStructureChanges,
+    hasSelfManagedModules,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.4.0';
+} from './lib/core.js?v=1.5.0';
+import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.0';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
@@ -50,6 +53,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     showBulkButton: true,
     reloadStyles: true,
     seamlessFallback: true,
+    managedReload: true,
     mode: HOT_RELOAD_MODE.SAFE,
     verboseLogging: false,
 });
@@ -62,6 +66,7 @@ const updating = new Set();
 const deleting = new Set();
 
 let initialized = false;
+const runtimeSupervisor = getRuntimeSupervisor({ eventSource, selfUrl: import.meta.url });
 let managerObserver = null;
 let managerUiFrame = null;
 let settings = null;
@@ -165,7 +170,7 @@ function renderSettings() {
 
     const intro = document.createElement('div');
     intro.className = 'ehr-notice';
-    intro.textContent = '安全模式只热载入具备清理钩子的脚本；CSS 会直接换新。更新与删除仍使用 SillyTavern 官方接口。';
+    intro.textContent = '优先使用扩展自带的清理钩子；无钩子的常规单文件扩展可由 Runtime Supervisor 托管，无法证明安全时仍会无感重启。';
 
     body.append(
         intro,
@@ -173,6 +178,7 @@ function renderSettings() {
         checkboxRow('接管扩展删除按钮', 'interceptDeleteButtons', '删除后立即卸载；不兼容脚本自动无感重启。'),
         checkboxRow('显示“智能热更新全部”', 'showBulkButton', '在扩展管理器工具栏加入一个火焰按钮。'),
         checkboxRow('立即替换样式文件', 'reloadStyles', 'CSS 可安全热替换，通常无需刷新页面。'),
+        checkboxRow('自动托管式热载入', 'managedReload', '追踪可逆的事件、计时器、Observer 和 DOM；发现不可逆风险时不会强行热载入。'),
         checkboxRow('不兼容脚本自动无感重启', 'seamlessFallback', '保存输入和聊天位置，自动刷新运行环境并恢复；目标扩展无需适配。'),
     );
 
@@ -684,9 +690,10 @@ async function evictExtensionAssetCaches(internalId) {
     return deleted;
 }
 
-async function inspectLocalModuleDependencies(internalId, manifest, token) {
-    if (!manifest?.js) return [];
-    const entryUrl = new URL(withCacheBuster(buildAssetUrl(internalId, manifest.js), token), location.origin);
+async function fetchExtensionEntrySource(internalId, manifest, token = '') {
+    if (!manifest?.js) return { entryUrl: null, source: '' };
+    const baseUrl = buildAssetUrl(internalId, manifest.js);
+    const entryUrl = new URL(token ? withCacheBuster(baseUrl, token) : baseUrl, location.origin);
     const manifestUrl = new URL(buildAssetUrl(internalId, 'manifest.json'), location.origin);
     const response = await fetch(entryUrl, {
         cache: 'no-store',
@@ -696,7 +703,48 @@ async function inspectLocalModuleDependencies(internalId, manifest, token) {
     if (!response.ok) {
         throw new Error(`Could not inspect extension entry (${response.status}).`);
     }
-    return findLocalModuleDependencies(await response.text(), entryUrl, new URL('./', manifestUrl));
+    return { entryUrl, manifestUrl, source: await response.text() };
+}
+
+async function inspectExtensionEntry(internalId, manifest, token = '') {
+    const inspection = await fetchExtensionEntrySource(internalId, manifest, token);
+    if (!inspection.entryUrl) return { source: '', localDependencies: [], risks: [] };
+    return {
+        source: inspection.source,
+        localDependencies: findLocalModuleDependencies(
+            inspection.source,
+            inspection.entryUrl,
+            new URL('./', inspection.manifestUrl),
+        ),
+        risks: findManagedRuntimeRisks(inspection.source),
+    };
+}
+
+async function assessManagedRuntime(internalId, manifest, isDisabled, cleanupHook) {
+    const snapshot = runtimeSupervisor?.getSnapshot(internalId) ?? null;
+    const assessment = {
+        eligible: false,
+        snapshot,
+        risks: [],
+        reason: 'not-requested',
+    };
+    if (!settings.managedReload || isDisabled || !manifest?.js || cleanupHook) return assessment;
+    if (!snapshot?.eligible) {
+        assessment.reason = !snapshot?.coverageComplete
+            ? 'tracker-started-too-late'
+            : snapshot?.opaqueReasons?.length ? 'opaque-runtime-effects' : 'runtime-ledger-incomplete';
+        return assessment;
+    }
+    try {
+        const inspection = await inspectExtensionEntry(internalId, manifest, `managed-audit-${Date.now()}`);
+        assessment.risks = inspection.risks;
+        assessment.eligible = inspection.risks.length === 0;
+        assessment.reason = assessment.eligible ? 'managed-runtime' : 'source-risk-detected';
+    } catch (error) {
+        assessment.reason = 'source-audit-failed';
+        assessment.error = error;
+    }
+    return assessment;
 }
 
 async function warmExtensionAssets(internalId, manifest) {
@@ -981,14 +1029,22 @@ async function updateOne(rawId, button = null, options = {}) {
             ? await importExtensionModule(internalId, oldManifest)
             : null;
         const cleanupHook = oldModule ? findCleanupHook(oldManifest, oldModule) : null;
+        const managedAssessment = await assessManagedRuntime(internalId, oldManifest, isDisabled, cleanupHook);
         let policy = classifyScriptReload({
             hasScript: Boolean(oldManifest.js),
             isDisabled,
             hasCleanupHook: Boolean(cleanupHook),
+            hasManagedRuntime: managedAssessment.eligible,
             mode: settings.mode,
         });
 
-        log('Updating', { externalId, isGlobal, policy, cleanupHook: cleanupHook?.name });
+        log('Updating', {
+            externalId,
+            isGlobal,
+            policy,
+            cleanupHook: cleanupHook?.name,
+            managedAssessment,
+        });
         result = await updateRepository(externalId, isGlobal);
         if (result.isUpToDate) {
             if (!options.quiet) notify('success', `${oldManifest.display_name ?? externalId} 已经是最新版本。`);
@@ -1007,10 +1063,18 @@ async function updateOne(rawId, button = null, options = {}) {
         }
         if (!isDisabled && policy.reloadScript) {
             try {
-                const localDependencies = await inspectLocalModuleDependencies(internalId, newManifest, token);
-                if (localDependencies.length > 0) {
-                    policy = { reloadScript: false, needsPageReload: true, reason: 'multi-file-module' };
-                    log('Local module dependencies require a seamless restart', { externalId, localDependencies });
+                const inspection = await inspectExtensionEntry(internalId, newManifest, token);
+                const localDependencies = inspection.localDependencies;
+                if (policy.reason === 'managed' && inspection.risks.length > 0) {
+                    policy = { reloadScript: false, needsPageReload: true, reason: 'managed-source-risk' };
+                    log('Updated source is not eligible for managed reload', { externalId, risks: inspection.risks });
+                } else if (localDependencies.length > 0) {
+                    if (hasSelfManagedModules(newManifest)) {
+                        log('Extension opted into self-managed local modules', { externalId, localDependencies });
+                    } else {
+                        policy = { reloadScript: false, needsPageReload: true, reason: 'multi-file-module' };
+                        log('Local module dependencies require a seamless restart', { externalId, localDependencies });
+                    }
                 }
             } catch (inspectionError) {
                 console.warn(LOG_PREFIX, `Could not inspect module dependencies for ${externalId}:`, inspectionError);
@@ -1030,13 +1094,21 @@ async function updateOne(rawId, button = null, options = {}) {
         let scriptReloaded = false;
         let styleReloaded = false;
         if (policy.reloadScript) {
-            if (cleanupHook) {
+            if (policy.reason === 'managed') {
+                runtimeTouched = true;
+                const disposal = await runtimeSupervisor.dispose(internalId);
+                log('Managed runtime disposed', { externalId, disposal });
+                if (!disposal.complete) {
+                    throw new Error(`Managed runtime cleanup was incomplete: ${disposal.failures.join('; ')}`);
+                }
+            } else if (cleanupHook) {
                 runtimeTouched = true;
                 await promiseWithTimeout(
                     Promise.resolve(cleanupHook.fn(hookContext)),
                     5000,
                     `${cleanupHook.name} hook timed out.`,
                 );
+                runtimeSupervisor?.discard(internalId);
             }
             try {
                 runtimeTouched = true;
@@ -1082,7 +1154,9 @@ async function updateOne(rawId, button = null, options = {}) {
                     ? '无法确认本地子模块是否全部换新'
                     : policy.reason === 'manifest-structure-changed'
                         ? 'manifest 运行结构已变化，需要让 SillyTavern 重建扩展状态'
-                        : '脚本没有清理钩子';
+                        : policy.reason === 'managed-source-risk'
+                            ? '新版脚本包含无法可靠回收的运行时操作'
+                            : '脚本没有清理钩子';
             message = settings.seamlessFallback
                 ? `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，将自动无感重启以安全应用。`
                 : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，请稍后刷新页面。`;
@@ -1090,8 +1164,11 @@ async function updateOne(rawId, button = null, options = {}) {
             status = 'updated-disabled';
             message = `${newManifest.display_name ?? externalId} 已更新；它当前未启用，不需要重载运行中的脚本。`;
         } else if (scriptReloaded) {
-            status = policy.reason === 'forced' ? 'force-reloaded' : 'hot-reloaded';
-            message = `${newManifest.display_name ?? externalId} 已更新并热载入${styleReloaded ? '（含样式）' : ''}。`;
+            status = policy.reason === 'forced'
+                ? 'force-reloaded'
+                : policy.reason === 'managed' ? 'managed-reloaded' : 'hot-reloaded';
+            const method = policy.reason === 'managed' ? '并由 Runtime Supervisor 完成托管换新' : '并热载入';
+            message = `${newManifest.display_name ?? externalId} 已更新${method}${styleReloaded ? '（含样式）' : ''}。`;
         } else if (!oldManifest.js) {
             status = 'style-reloaded';
             message = `${newManifest.display_name ?? externalId} 已更新${styleReloaded ? '，样式已立即生效' : ''}。`;
@@ -1155,7 +1232,7 @@ async function updateAllVisible(button) {
 
     const failed = results.filter((item) => item.status === 'failed').length;
     const needsReload = results.filter((item) => item.status === 'needs-page-reload').length;
-    const hot = results.filter((item) => ['hot-reloaded', 'force-reloaded', 'style-reloaded', 'updated-disabled'].includes(item.status)).length;
+    const hot = results.filter((item) => ['hot-reloaded', 'managed-reloaded', 'force-reloaded', 'style-reloaded', 'updated-disabled'].includes(item.status)).length;
     const summary = settings.seamlessFallback && needsReload
         ? `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个将通过一次无感重启应用，${failed} 个失败。`
         : `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个脚本需稍后刷新，${failed} 个失败。`;
@@ -1226,6 +1303,7 @@ function initialize() {
     if (initialized) return;
     initialized = true;
     loadSettings();
+    log('Runtime Supervisor status', runtimeSupervisor.getStatus());
     scheduleRestartStateRestore();
     renderSettings();
     document.addEventListener('click', captureUpdateClick, true);

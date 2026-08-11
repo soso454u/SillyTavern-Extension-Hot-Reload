@@ -8,7 +8,9 @@ import {
     findCleanupHook,
     findDeletionHook,
     findLocalModuleDependencies,
+    findManagedRuntimeRisks,
     findManifestStructureChanges,
+    hasSelfManagedModules,
     isSameAsset,
     normalizeDrawerTitle,
     normalizeExternalId,
@@ -100,6 +102,32 @@ test('detects lifecycle manifest changes but ignores cosmetic metadata', () => {
     }), ['js', 'requires']);
 });
 
+test('detects runtime effects that managed cleanup cannot safely reverse', () => {
+    const source = `
+        window.sharedApi = patchedApi;
+        HTMLElement.prototype.focus = replacement;
+        panel.innerHTML = html;
+        document.body.classList.add('demo-active');
+        import(runtimeUrl);
+        customElements.define('demo-panel', DemoPanel);
+    `;
+    assert.deepEqual(findManagedRuntimeRisks(source), [
+        'global-assignment',
+        'prototype-mutation',
+        'html-replacement',
+        'existing-dom-mutation',
+        'opaque-dynamic-import',
+        'custom-element',
+    ]);
+    assert.deepEqual(findManagedRuntimeRisks('document.addEventListener("click", handler);'), []);
+});
+
+test('recognizes explicit self-managed module declarations', () => {
+    assert.equal(hasSelfManagedModules({ extension_hot_reload: { self_managed_modules: true } }), true);
+    assert.equal(hasSelfManagedModules({ hot_reload: { self_managed_modules: true } }), true);
+    assert.equal(hasSelfManagedModules({ extension_hot_reload: { self_managed_modules: false } }), false);
+});
+
 test('finds explicit cleanup hooks before official disable hooks', () => {
     const explicit = () => {};
     const disable = () => {};
@@ -125,6 +153,7 @@ test('classifies safe, disabled, and forced script reloads', () => {
     });
     assert.equal(classifyScriptReload({ hasScript: true, isDisabled: true, hasCleanupHook: false, mode: HOT_RELOAD_MODE.SAFE }).reason, 'disabled');
     assert.equal(classifyScriptReload({ hasScript: true, isDisabled: false, hasCleanupHook: false, mode: HOT_RELOAD_MODE.FORCE }).reason, 'forced');
+    assert.equal(classifyScriptReload({ hasScript: true, isDisabled: false, hasCleanupHook: false, hasManagedRuntime: true, mode: HOT_RELOAD_MODE.SAFE }).reason, 'managed');
     assert.equal(classifyScriptReload({ hasScript: true, isDisabled: false, hasCleanupHook: false, mode: HOT_RELOAD_MODE.SAFE }).needsPageReload, true);
 });
 
