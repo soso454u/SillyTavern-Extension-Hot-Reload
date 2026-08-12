@@ -30,8 +30,8 @@ import {
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.5.0';
-import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.0';
+} from './lib/core.js?v=1.5.1';
+import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.1';
 
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
@@ -143,12 +143,13 @@ function checkboxRow(label, key, help) {
 }
 
 function renderSettings() {
-    document.getElementById(ROOT_ID)?.remove();
     const host = getSettingsHost();
     if (!host) {
         log('Extension settings host was not found.');
-        return;
+        return false;
     }
+
+    document.getElementById(ROOT_ID)?.remove();
 
     const root = document.createElement('div');
     root.id = ROOT_ID;
@@ -204,6 +205,7 @@ function renderSettings() {
 
     root.append(header, body);
     host.append(root);
+    return true;
 }
 
 function makeBulkButton() {
@@ -1253,6 +1255,11 @@ function scheduleEnsureUi() {
 
 function mutationContainsManagerUi(mutation) {
     if (mutation.type !== 'childList') return false;
+    // During a first-time installation SillyTavern can import this module
+    // before its extension settings host has been mounted. Any later DOM
+    // mutation that makes the host available must get one chance to attach
+    // the drawer, even if the added wrapper is not itself a manager node.
+    if (!document.getElementById(ROOT_ID) && getSettingsHost()) return true;
     if (mutation.target instanceof Element && mutation.target.matches(MANAGER_UI_SELECTOR)) return true;
     return [...mutation.addedNodes].some((node) => node instanceof Element
         && (node.matches(MANAGER_UI_SELECTOR) || node.querySelector(MANAGER_UI_SELECTOR)));
@@ -1315,6 +1322,11 @@ export function onActivate() {
     initialize();
 }
 
+export function onInstall() {
+    initialize();
+    ensureUi();
+}
+
 export function onUpdate() {
     loadSettings();
     renderSettings();
@@ -1329,7 +1341,8 @@ export function onHotUnload() {
 }
 
 // Compatibility with SillyTavern versions that load extension modules but do
-// not invoke manifest activation hooks yet. The initializer is idempotent.
+// not invoke manifest activation hooks yet. Install/activate and this fallback
+// can run in either order because the initializer is idempotent.
 if (document.readyState === 'loading') {
     compatibilityReadyListener = initialize;
     document.addEventListener('DOMContentLoaded', compatibilityReadyListener, { once: true });
