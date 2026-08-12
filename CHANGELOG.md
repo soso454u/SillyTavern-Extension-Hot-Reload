@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.5.3 - 2026-08-13
+
+- “智能热更新全部”优先挂载到官方 `.extensions_toolbar`，找不到时自动识别扩展管理弹窗中的 Update All 操作栏。
+- 兼容 SillyTavern 1.12.13 将管理按钮放在 `.popup-controls` 的旧结构，以及移除或改名工具栏 class 的主题和第三方分支。
+- 旧结构回退严格限定在包含 `.extensions_info` 的同一弹窗，并校验 Update All 的 i18n/可见标签，避免误插入其他按钮组。
+- 新增工具栏标签识别测试，并同步升级 manifest、包版本和内部模块令牌到 `1.5.3`。
+
 ## 1.5.2 - 2026-08-12
 
 - 修复 SillyTavern 1.17 等未导出 `getExtensionManifest` 的版本会在模块解析阶段直接拒绝加载插件、导致设置面板始终不出现的问题。

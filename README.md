@@ -12,6 +12,7 @@
 - 直接接管扩展列表里原有的单个更新按钮；
 - 接管原有的删除按钮，保留确认与可选数据清理，并尽量直接卸载当前运行实例；
 - 在扩展管理器中加入“智能热更新全部”；
+- 优先使用官方扩展工具栏，并能在旧版或魔改 DOM 中自动定位 Update All 所在的操作栏；
 - 通过带版本参数的新 `<link>` 无闪烁替换 CSS；
 - 对提供 `hot_reload`、`unload` 或 `disable` 钩子的扩展，先清理旧运行时，再导入新入口并调用 `update` / `activate`；
 - Runtime Supervisor 从扩展启动阶段记录 SillyTavern 事件、DOM/jQuery 监听器、计时器、animation frame、Observer、未完成的 fetch、Worker/Socket 和明确归属的 DOM 节点；

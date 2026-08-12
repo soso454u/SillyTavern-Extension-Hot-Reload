@@ -12,6 +12,7 @@ import {
     findManifestStructureChanges,
     hasSelfManagedModules,
     isSameAsset,
+    isUpdateAllLabel,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
@@ -31,6 +32,15 @@ test('normalizes extension drawer titles for restart matching', () => {
     assert.equal(normalizeDrawerTitle('  酒馆助手   New! '), '酒馆助手');
     assert.equal(normalizeDrawerTitle('Selene 音乐播放器'), 'Selene 音乐播放器');
     assert.equal(normalizeDrawerTitle('New Character Tools'), 'New Character Tools');
+});
+
+test('recognizes native and translated update-all toolbar labels', () => {
+    assert.equal(isUpdateAllLabel('Update all'), true);
+    assert.equal(isUpdateAllLabel(' [title]Update   all '), true);
+    assert.equal(isUpdateAllLabel('更新全部'), true);
+    assert.equal(isUpdateAllLabel('全部更新'), true);
+    assert.equal(isUpdateAllLabel('Update enabled'), false);
+    assert.equal(isUpdateAllLabel('Close'), false);
 });
 
 test('resolves local and global extension types', () => {

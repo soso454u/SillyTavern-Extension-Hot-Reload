@@ -20,15 +20,16 @@ import {
     findManifestStructureChanges,
     hasSelfManagedModules,
     isSameAsset,
+    isUpdateAllLabel,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.5.2';
-import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.2';
+} from './lib/core.js?v=1.5.3';
+import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.3';
 
-const PLUGIN_VERSION = '1.5.2';
+const PLUGIN_VERSION = '1.5.3';
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
 const ROOT_ID = 'extension-hot-reload-settings';
@@ -250,6 +251,36 @@ function makeBulkButton() {
     return button;
 }
 
+function isUpdateAllControl(control) {
+    return [
+        control.dataset?.i18n,
+        control.getAttribute?.('aria-label'),
+        control.getAttribute?.('title'),
+        control.textContent,
+    ].some(isUpdateAllLabel);
+}
+
+function findManagerToolbars() {
+    const toolbars = new Set(document.querySelectorAll('.extensions_info .extensions_toolbar'));
+
+    for (const manager of document.querySelectorAll('.extensions_info')) {
+        const popup = manager.closest('.popup, dialog, .dialogue_popup, #dialogue_popup');
+        const scope = popup ?? manager;
+        const controls = scope.querySelectorAll('button, .menu_button, [role="button"]');
+        const updateAllControl = [...controls].find(isUpdateAllControl);
+        if (!updateAllControl) continue;
+
+        const toolbar = updateAllControl.closest(
+            '.extensions_toolbar, .popup-controls, #dialogue_popup_controls, .dialogue_popup_controls',
+        ) ?? updateAllControl.parentElement;
+        if (toolbar && scope.contains(toolbar)) {
+            toolbars.add(toolbar);
+        }
+    }
+
+    return [...toolbars];
+}
+
 function decorateManager() {
     document.querySelectorAll(`.${BULK_BUTTON_CLASS}`).forEach((button) => {
         button.classList.toggle('displayNone', !settings?.showBulkButton);
@@ -257,7 +288,7 @@ function decorateManager() {
     if (!settings?.showBulkButton) {
         return;
     }
-    for (const toolbar of document.querySelectorAll('.extensions_toolbar')) {
+    for (const toolbar of findManagerToolbars()) {
         if (!toolbar.querySelector(`.${BULK_BUTTON_CLASS}`)) {
             toolbar.prepend(makeBulkButton());
         }
