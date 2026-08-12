@@ -47,6 +47,21 @@
     opacity: 0.75;
 }
 
+.ehr-footer {
+    align-items: center;
+    border-top: 1px solid color-mix(in srgb, var(--SmartThemeBorderColor) 55%, transparent);
+    display: flex;
+    justify-content: flex-end;
+    padding-top: 0.45rem;
+}
+
+.ehr-version {
+    font-size: 0.78em;
+    font-variant-numeric: tabular-nums;
+    opacity: 0.55;
+    user-select: none;
+}
+
 .extension-hot-reload-all {
     border-color: color-mix(in srgb, currentColor 55%, #ff8a3d 45%);
 }

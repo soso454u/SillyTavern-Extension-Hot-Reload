@@ -1,9 +1,4 @@
-import {
-    extension_settings,
-    extensionTypes,
-    getExtensionManifest,
-    loadExtensionSettings,
-} from '../../../extensions.js';
+import * as extensionsApi from '../../../extensions.js';
 import {
     eventSource,
     event_types,
@@ -30,9 +25,10 @@ import {
     resolveExtensionType,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.5.1';
-import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.1';
+} from './lib/core.js?v=1.5.2';
+import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.2';
 
+const PLUGIN_VERSION = '1.5.2';
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
 const ROOT_ID = 'extension-hot-reload-settings';
@@ -57,6 +53,8 @@ const DEFAULT_SETTINGS = Object.freeze({
     mode: HOT_RELOAD_MODE.SAFE,
     verboseLogging: false,
 });
+
+const { extension_settings, loadExtensionSettings } = extensionsApi;
 
 /** @type {Map<string, object>} */
 const runtimeManifests = new Map();
@@ -109,8 +107,27 @@ function persistSettings() {
     saveSettingsDebounced();
 }
 
-function getManifest(internalId) {
-    return runtimeManifests.get(internalId) ?? getExtensionManifest(internalId);
+async function getManifest(internalId) {
+    const cached = runtimeManifests.get(internalId);
+    if (cached) return cached;
+
+    if (typeof extensionsApi.getExtensionManifest === 'function') {
+        const manifest = extensionsApi.getExtensionManifest(internalId);
+        if (manifest) return manifest;
+    }
+
+    // `getExtensionManifest` was added after lifecycle hooks. SillyTavern
+    // versions without that export must still be able to load this module;
+    // fetch the same manifest directly instead of making the whole static
+    // import fail before the settings drawer can render.
+    try {
+        const manifest = await fetchFreshManifest(internalId, `compat-${Date.now()}`);
+        runtimeManifests.set(internalId, manifest);
+        return manifest;
+    } catch (error) {
+        console.warn(LOG_PREFIX, `Could not resolve manifest for ${internalId}:`, error);
+        return null;
+    }
 }
 
 function getSettingsHost() {
@@ -201,7 +218,14 @@ function renderSettings() {
     const protocol = document.createElement('p');
     protocol.className = 'ehr-protocol';
     protocol.textContent = '扩展作者可在 manifest hooks 中声明 hot_reload、unload 或 disable，使脚本进入安全热更新路径。';
-    body.append(protocol);
+
+    const footer = document.createElement('div');
+    footer.className = 'ehr-footer';
+    const version = document.createElement('span');
+    version.className = 'ehr-version';
+    version.textContent = `v${PLUGIN_VERSION}`;
+    footer.append(version);
+    body.append(protocol, footer);
 
     root.append(header, body);
     host.append(root);
@@ -826,7 +850,7 @@ async function confirmAndDelete(rawId, button) {
     if (deleting.has(externalId) || updating.has(externalId)) return;
 
     const internalId = toInternalId(externalId);
-    const manifest = getManifest(internalId);
+    const manifest = await getManifest(internalId);
     if (!manifest) {
         notify('error', `找不到 ${externalId} 的 manifest。`);
         return;
@@ -843,7 +867,7 @@ async function confirmAndDelete(rawId, button) {
 
     const shouldClean = hasCleanHook && Boolean(popup.inputResults?.get('extension_delete_cleanup'));
     const isDisabled = extension_settings.disabledExtensions?.includes(internalId) ?? false;
-    const isGlobal = resolveExtensionType(extensionTypes, externalId) === 'global';
+    const isGlobal = resolveExtensionType(extensionsApi.extensionTypes, externalId) === 'global';
     let oldModule = null;
     const hasDeleteHook = typeof manifest?.hooks?.delete === 'string' && manifest.hooks.delete.length > 0;
     const needsHookModule = !isDisabled || hasDeleteHook || (shouldClean && hasCleanHook);
@@ -1008,7 +1032,7 @@ async function updateOne(rawId, button = null, options = {}) {
     }
 
     const internalId = toInternalId(externalId);
-    const oldManifest = getManifest(internalId);
+    const oldManifest = await getManifest(internalId);
     if (!oldManifest) {
         const error = new Error(`找不到 ${externalId} 的 manifest。`);
         notify('error', error.message);
@@ -1025,7 +1049,7 @@ async function updateOne(rawId, button = null, options = {}) {
     let newManifest = null;
 
     try {
-        const isGlobal = resolveExtensionType(extensionTypes, externalId) === 'global';
+        const isGlobal = resolveExtensionType(extensionsApi.extensionTypes, externalId) === 'global';
         const isDisabled = extension_settings.disabledExtensions?.includes(internalId) ?? false;
         const oldModule = !isDisabled && oldManifest.js
             ? await importExtensionModule(internalId, oldManifest)
