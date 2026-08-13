@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.4 - 2026-08-14
+
+- 接管 SillyTavern / TauriTavern 原生“Update all / 更新全部”按钮，绕开其在执行更新前就设置 `requiresReload`、导致全部失败后仍刷新页面的路径。
+- 严格校验更新接口的 `isUpToDate` 结果，并兼容 Tauri/Rust 风格的 snake_case 回包；含糊或损坏的回包按失败处理，不再误判为已更新。
+- 只有更新接口确认文件变化且新版 manifest 已成功读取后，才允许自动无感重启；无法验证的结果会明确警告并保持当前页面。
+- 批量摘要单独统计“结果未验证”，不会把这类项目加入重启名单。
+- 补充 TauriTavern 安装目录排查说明；本插件的正式文件夹名为 `SillyTavern-Extension-Hot-Reload`。
+- 新增更新结果、重启资格和原生 Update All 接管测试，并同步升级 manifest、包版本和内部模块令牌到 `1.5.4`。
+
 ## 1.5.3 - 2026-08-13
 
 - “智能热更新全部”优先挂载到官方 `.extensions_toolbar`，找不到时自动识别扩展管理弹窗中的 Update All 操作栏。

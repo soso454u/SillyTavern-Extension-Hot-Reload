@@ -13,9 +13,11 @@ import {
     hasSelfManagedModules,
     isSameAsset,
     isUpdateAllLabel,
+    normalizeRepositoryUpdateResult,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
+    shouldAutoRestartUpdate,
     toInternalId,
     withCacheBuster,
 } from '../lib/core.js';
@@ -41,6 +43,28 @@ test('recognizes native and translated update-all toolbar labels', () => {
     assert.equal(isUpdateAllLabel('全部更新'), true);
     assert.equal(isUpdateAllLabel('Update enabled'), false);
     assert.equal(isUpdateAllLabel('Close'), false);
+});
+
+test('normalizes native-host update results and rejects ambiguous responses', () => {
+    assert.deepEqual(normalizeRepositoryUpdateResult({
+        isUpToDate: false,
+        shortCommitHash: 'abc1234',
+    }), {
+        isUpToDate: false,
+        shortCommitHash: 'abc1234',
+    });
+    assert.equal(normalizeRepositoryUpdateResult({
+        is_up_to_date: true,
+        short_commit_hash: 'def5678',
+    }).isUpToDate, true);
+    assert.throws(() => normalizeRepositoryUpdateResult({ shortCommitHash: 'abc1234' }));
+    assert.throws(() => normalizeRepositoryUpdateResult(null));
+});
+
+test('allows automatic restart only after a verified update', () => {
+    assert.equal(shouldAutoRestartUpdate({ status: 'needs-page-reload', updateVerified: true }), true);
+    assert.equal(shouldAutoRestartUpdate({ status: 'needs-page-reload', updateVerified: false }), false);
+    assert.equal(shouldAutoRestartUpdate({ status: 'failed', updateVerified: true }), false);
 });
 
 test('resolves local and global extension types', () => {

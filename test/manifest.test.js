@@ -22,3 +22,11 @@ test('keeps the entry compatible with extension modules that lack getExtensionMa
     assert.match(entrySource, new RegExp(`const PLUGIN_VERSION = ['"]${manifest.version}['"]`));
     assert.match(entrySource, /version\.textContent = `v\$\{PLUGIN_VERSION\}`/);
 });
+
+test('intercepts the native update-all control before its unconditional reload path', async () => {
+    const entrySource = await readFile(entryUrl, 'utf8');
+
+    assert.match(entrySource, /function findNativeUpdateAllControl\s*\(/);
+    assert.match(entrySource, /if \(updateAllButton\) \{\s*void updateAllVisible\(button\);/s);
+    assert.match(entrySource, /document\.addEventListener\('click', captureUpdateClick, true\)/);
+});

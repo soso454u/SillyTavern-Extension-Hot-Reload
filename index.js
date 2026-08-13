@@ -21,15 +21,17 @@ import {
     hasSelfManagedModules,
     isSameAsset,
     isUpdateAllLabel,
+    normalizeRepositoryUpdateResult,
     normalizeDrawerTitle,
     normalizeExternalId,
     resolveExtensionType,
+    shouldAutoRestartUpdate,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.5.3';
-import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.3';
+} from './lib/core.js?v=1.5.4';
+import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.4';
 
-const PLUGIN_VERSION = '1.5.3';
+const PLUGIN_VERSION = '1.5.4';
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
 const ROOT_ID = 'extension-hot-reload-settings';
@@ -310,22 +312,40 @@ function findActionButton(event, selector) {
     return button instanceof HTMLElement ? button : null;
 }
 
+function findNativeUpdateAllControl(event) {
+    if (!(event.target instanceof Element)) return null;
+    const control = event.target.closest('button, .menu_button, [role="button"]');
+    if (!(control instanceof HTMLElement)
+        || control.classList.contains(BULK_BUTTON_CLASS)
+        || !isUpdateAllControl(control)) {
+        return null;
+    }
+    return findManagerToolbars().some((toolbar) => toolbar.contains(control)) ? control : null;
+}
+
 function captureUpdateClick(event) {
     const updateButton = settings?.interceptUpdateButtons
         ? findActionButton(event, '.extensions_info .extension_block .btn_update')
         : null;
+    const updateAllButton = settings?.interceptUpdateButtons
+        ? findNativeUpdateAllControl(event)
+        : null;
     const deleteButton = settings?.interceptDeleteButtons
         ? findActionButton(event, '.extensions_info .extension_block .btn_delete')
         : null;
-    const button = updateButton ?? deleteButton;
+    const button = updateButton ?? updateAllButton ?? deleteButton;
     if (!button || button.classList.contains('displayNone')) return;
 
     event.preventDefault();
     event.stopPropagation();
     event.stopImmediatePropagation();
+    if (updateAllButton) {
+        void updateAllVisible(button);
+        return;
+    }
     if (updateButton) {
         void updateOne(button.dataset.name, button).then((result) => {
-            if (result.status === 'needs-page-reload' && settings.seamlessFallback) {
+            if (shouldAutoRestartUpdate(result) && settings.seamlessFallback) {
                 return requestSeamlessRestart([result.displayName ?? button.dataset.name]);
             }
         });
@@ -840,7 +860,7 @@ async function updateRepository(externalId, isGlobal) {
         const message = await response.text();
         throw new Error(message || `Extension update failed (${response.status}).`);
     }
-    return response.json();
+    return normalizeRepositoryUpdateResult(await response.json());
 }
 
 async function deleteRepository(externalId, isGlobal) {
@@ -1075,6 +1095,7 @@ async function updateOne(rawId, button = null, options = {}) {
     button?.querySelector('i')?.classList.add('fa-spin');
 
     let repositoryUpdated = false;
+    let updateVerified = false;
     let runtimeTouched = false;
     let result = null;
     let newManifest = null;
@@ -1113,6 +1134,7 @@ async function updateOne(rawId, button = null, options = {}) {
         const token = `${result.shortCommitHash ?? 'updated'}-${Date.now()}`;
         await evictExtensionAssetCaches(internalId);
         newManifest = await fetchFreshManifest(internalId, token);
+        updateVerified = true;
         const manifestStructureChanges = findManifestStructureChanges(oldManifest, newManifest);
         if (manifestStructureChanges.length > 0) {
             policy = { reloadScript: false, needsPageReload: true, reason: 'manifest-structure-changed' };
@@ -1235,10 +1257,16 @@ async function updateOne(rawId, button = null, options = {}) {
         if (!options.quiet) {
             notify(status === 'needs-page-reload' ? 'warning' : 'success', message);
         }
-        return { status, result, message, displayName: newManifest.display_name ?? externalId };
+        return {
+            status,
+            result,
+            message,
+            displayName: newManifest.display_name ?? externalId,
+            updateVerified,
+        };
     } catch (error) {
         console.error(LOG_PREFIX, `Failed to update ${externalId}:`, error);
-        if (repositoryUpdated) {
+        if (repositoryUpdated && updateVerified) {
             const displayName = newManifest?.display_name ?? oldManifest.display_name ?? externalId;
             if (newManifest) {
                 runtimeManifests.set(internalId, newManifest);
@@ -1256,11 +1284,25 @@ async function updateOne(rawId, button = null, options = {}) {
                 error,
                 message,
                 displayName,
+                updateVerified,
                 recoveryReason: runtimeTouched ? 'runtime-touched' : 'post-update-failure',
             };
         }
+        if (repositoryUpdated) {
+            const displayName = oldManifest.display_name ?? externalId;
+            const message = `${displayName} 的更新接口已返回成功，但无法验证新版 manifest；为避免失败后误重启，本次不会自动重启。请重新打开扩展管理器确认版本，必要时手动刷新。`;
+            if (!options.quiet) notify('warning', message);
+            return {
+                status: 'updated-unverified',
+                result,
+                error,
+                message,
+                displayName,
+                updateVerified: false,
+            };
+        }
         if (!options.quiet) notify('error', `${externalId} 更新失败：${error.message}`);
-        return { status: 'failed', error };
+        return { status: 'failed', error, updateVerified: false };
     } finally {
         updating.delete(externalId);
         button?.removeAttribute('disabled');
@@ -1288,14 +1330,16 @@ async function updateAllVisible(button) {
     button.querySelector('i')?.classList.remove('fa-spin');
 
     const failed = results.filter((item) => item.status === 'failed').length;
-    const needsReload = results.filter((item) => item.status === 'needs-page-reload').length;
+    const unverified = results.filter((item) => item.status === 'updated-unverified').length;
+    const needsReload = results.filter(shouldAutoRestartUpdate).length;
     const hot = results.filter((item) => ['hot-reloaded', 'managed-reloaded', 'force-reloaded', 'style-reloaded', 'updated-disabled'].includes(item.status)).length;
+    const unresolvedText = unverified ? `，${unverified} 个结果未验证且不会自动重启` : '';
     const summary = settings.seamlessFallback && needsReload
-        ? `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个将通过一次无感重启应用，${failed} 个失败。`
-        : `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个脚本需稍后刷新，${failed} 个失败。`;
-    notify(failed ? 'warning' : needsReload ? 'warning' : 'success', summary, '批量热更新完成');
+        ? `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个将通过一次无感重启应用，${failed} 个失败${unresolvedText}。`
+        : `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个脚本需稍后刷新，${failed} 个失败${unresolvedText}。`;
+    notify(failed || unverified ? 'warning' : needsReload ? 'warning' : 'success', summary, '批量热更新完成');
     if (needsReload && settings.seamlessFallback) {
-        const names = results.filter((item) => item.status === 'needs-page-reload').map((item) => item.displayName);
+        const names = results.filter(shouldAutoRestartUpdate).map((item) => item.displayName);
         await requestSeamlessRestart(names);
     }
 }
