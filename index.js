@@ -11,6 +11,7 @@ import { POPUP_RESULT, POPUP_TYPE, Popup } from '../../../popup.js';
 import { escapeHtml } from '../../../utils.js';
 import {
     HOT_RELOAD_MODE,
+    buildRestartNavigationUrl,
     buildAssetUrl,
     classifyScriptReload,
     findCleanupHook,
@@ -24,14 +25,16 @@ import {
     normalizeRepositoryUpdateResult,
     normalizeDrawerTitle,
     normalizeExternalId,
+    normalizeRestartPath,
     resolveExtensionType,
     shouldAutoRestartUpdate,
+    stripRestartNavigationToken,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.5.4';
-import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.4';
+} from './lib/core.js?v=1.5.5';
+import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.5';
 
-const PLUGIN_VERSION = '1.5.4';
+const PLUGIN_VERSION = '1.5.5';
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
 const ROOT_ID = 'extension-hot-reload-settings';
@@ -40,7 +43,8 @@ const RESTART_OVERLAY_ID = 'extension-hot-reload-restart-overlay';
 const RESTART_STATE_KEY = 'extension-hot-reload:restart-state';
 const RESTART_STATE_MAX_AGE = 2 * 60 * 1000;
 const RESTART_STATE_VERSION = 3;
-const LATE_RESTORE_TIMEOUT = 6000;
+const RESTART_READY_FALLBACK_TIMEOUT = 6000;
+const LATE_RESTORE_TIMEOUT = 4000;
 const REPOSITORY_REQUEST_TIMEOUT = 120000;
 const ASSET_REQUEST_TIMEOUT = 15000;
 const ASSET_WARMUP_BUDGET = 1250;
@@ -413,7 +417,7 @@ function captureRestartState(updatedExtensions, action = 'update') {
     return {
         version: RESTART_STATE_VERSION,
         createdAt: Date.now(),
-        path: `${location.pathname}${location.search}${location.hash}`,
+        path: normalizeRestartPath(location.href),
         updatedExtensions: updatedExtensions.filter(Boolean).map(String),
         action,
         draft: textarea instanceof HTMLTextAreaElement ? textarea.value : '',
@@ -436,7 +440,7 @@ function readRestartState() {
         const raw = sessionStorage.getItem(RESTART_STATE_KEY);
         if (!raw) return null;
         const state = JSON.parse(raw);
-        const currentPath = `${location.pathname}${location.search}${location.hash}`;
+        const currentPath = normalizeRestartPath(location.href);
         if (!state || state.version !== RESTART_STATE_VERSION || state.path !== currentPath || Date.now() - state.createdAt > RESTART_STATE_MAX_AGE) {
             sessionStorage.removeItem(RESTART_STATE_KEY);
             return null;
@@ -613,8 +617,16 @@ function beginRestartStateRestore(state) {
     restoreLateMountedUi(state);
 }
 
+function clearRestartNavigationToken() {
+    const cleanUrl = stripRestartNavigationToken(location.href);
+    if (cleanUrl !== location.href) {
+        history.replaceState(history.state, '', cleanUrl);
+    }
+}
+
 function scheduleRestartStateRestore() {
     const state = readRestartState();
+    clearRestartNavigationToken();
     if (!state) return;
 
     let started = false;
@@ -632,9 +644,16 @@ function scheduleRestartStateRestore() {
         requestAnimationFrame(() => beginRestartStateRestore(state));
     };
 
+    // TauriTavern deliberately activates third-party extensions after
+    // APP_READY. Waiting for the event again would always hit the fallback.
+    if (globalThis.__TAURITAVERN__) {
+        requestAnimationFrame(start);
+        return;
+    }
+
     restoreReadyHandler = start;
     eventSource.once(event_types.APP_READY, restoreReadyHandler);
-    restoreFallbackTimer = setTimeout(start, 15000);
+    restoreFallbackTimer = setTimeout(start, RESTART_READY_FALLBACK_TIMEOUT);
 }
 
 function showRestartOverlay(updatedExtensions, action = 'update') {
@@ -667,7 +686,8 @@ async function performSeamlessRestart(updatedExtensions, action = 'update') {
     }
     showRestartOverlay(updatedExtensions, action);
     await new Promise((resolve) => setTimeout(resolve, 40));
-    location.reload();
+    const token = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    location.replace(buildRestartNavigationUrl(location.href, token));
 }
 
 async function requestSeamlessRestart(updatedExtensions, action = 'update') {
@@ -931,6 +951,7 @@ async function confirmAndDelete(rawId, button) {
     }
     const deletionHook = oldModule ? findDeletionHook(manifest, oldModule) : null;
     const cleanupHook = oldModule ? findCleanupHook(manifest, oldModule) : null;
+    const managedAssessment = await assessManagedRuntime(internalId, manifest, isDisabled, null);
     let runtimeDisposed = isDisabled || !manifest.js;
     let disposalAttempted = false;
     const hookContext = Object.freeze({
@@ -981,12 +1002,22 @@ async function confirmAndDelete(rawId, button) {
                 }
             }
         }
+        if (!runtimeDisposed && managedAssessment.eligible) {
+            disposalAttempted = true;
+            const disposal = await runtimeSupervisor.dispose(internalId);
+            log('Managed runtime disposed for deletion', { externalId, disposal });
+            runtimeDisposed = disposal.complete;
+            if (!disposal.complete) {
+                console.warn(LOG_PREFIX, `Managed deletion cleanup was incomplete for ${externalId}:`, disposal.failures);
+            }
+        }
 
         await deleteRepository(externalId, isGlobal);
         repositoryDeleted = true;
         removeExtensionStyles(internalId, manifest);
         removeManagerRows(externalId);
         runtimeManifests.delete(internalId);
+        runtimeSupervisor.discard(internalId);
         extension_settings.disabledExtensions = (extension_settings.disabledExtensions ?? []).filter((name) => name !== internalId);
         await saveSettings();
         await loadExtensionSettings({}, false, false);

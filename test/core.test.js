@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
     HOT_RELOAD_MODE,
+    buildRestartNavigationUrl,
     buildAssetUrl,
     classifyScriptReload,
     findCleanupHook,
@@ -16,8 +17,10 @@ import {
     normalizeRepositoryUpdateResult,
     normalizeDrawerTitle,
     normalizeExternalId,
+    normalizeRestartPath,
     resolveExtensionType,
     shouldAutoRestartUpdate,
+    stripRestartNavigationToken,
     toInternalId,
     withCacheBuster,
 } from '../lib/core.js';
@@ -65,6 +68,14 @@ test('allows automatic restart only after a verified update', () => {
     assert.equal(shouldAutoRestartUpdate({ status: 'needs-page-reload', updateVerified: true }), true);
     assert.equal(shouldAutoRestartUpdate({ status: 'needs-page-reload', updateVerified: false }), false);
     assert.equal(shouldAutoRestartUpdate({ status: 'failed', updateVerified: true }), false);
+});
+
+test('uses a one-shot navigation token without changing restart-state identity', () => {
+    const original = 'https://tauri.localhost/?foo=1#chat';
+    const restartUrl = buildRestartNavigationUrl(original, 'token-1');
+    assert.equal(restartUrl, 'https://tauri.localhost/?foo=1&st_hot_restart=token-1#chat');
+    assert.equal(normalizeRestartPath(restartUrl), '/?foo=1#chat');
+    assert.equal(stripRestartNavigationToken(restartUrl), original);
 });
 
 test('resolves local and global extension types', () => {

@@ -30,3 +30,12 @@ test('intercepts the native update-all control before its unconditional reload p
     assert.match(entrySource, /if \(updateAllButton\) \{\s*void updateAllVisible\(button\);/s);
     assert.match(entrySource, /document\.addEventListener\('click', captureUpdateClick, true\)/);
 });
+
+test('uses fresh navigation and managed runtime cleanup for deletions', async () => {
+    const entrySource = await readFile(entryUrl, 'utf8');
+
+    assert.doesNotMatch(entrySource, /location\.reload\s*\(/);
+    assert.match(entrySource, /location\.replace\(buildRestartNavigationUrl\(/);
+    assert.match(entrySource, /Managed runtime disposed for deletion/);
+    assert.match(entrySource, /await runtimeSupervisor\.dispose\(internalId\)/);
+});

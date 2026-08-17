@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.5.5 - 2026-08-17
+
+- 修复 TauriTavern 在 `APP_READY` 后才激活第三方扩展、重启恢复却再次等待同一事件而固定空等 15 秒的问题；TauriTavern 现在立即进入恢复流程。
+- 将普通环境的恢复兜底从 15 秒缩短到 6 秒，晚挂载界面恢复上限从 6 秒缩短到 4 秒。
+- 无感重启由 `location.reload()` 改为带一次性 `st_hot_restart` 令牌的同源 `location.replace()`，强制 WebView 请求新文档；新页面启动后自动清理令牌。
+- 删除流程接入 Runtime Supervisor：没有 manifest cleanup hook、但可逆运行资源已被完整追踪且源码审计安全的扩展，现在可直接清理监听器、计时器、Observer、DOM 和持久连接后热删除。
+- 显式 cleanup hook 失败时也可回退到 Supervisor 托管清理；删除完成后释放对应运行时账本。
+- 新增重启 URL、Tauri 恢复路径和托管热删除测试，并同步升级 manifest、包版本和内部模块令牌到 `1.5.5`。
+
 ## 1.5.4 - 2026-08-14
 
 - 接管 SillyTavern / TauriTavern 原生“Update all / 更新全部”按钮，绕开其在执行更新前就设置 `requiresReload`、导致全部失败后仍刷新页面的路径。
