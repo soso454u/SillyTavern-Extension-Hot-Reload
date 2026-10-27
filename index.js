@@ -31,10 +31,11 @@ import {
     stripRestartNavigationToken,
     toInternalId,
     withCacheBuster,
-} from './lib/core.js?v=1.5.5';
-import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.5.5';
+} from './lib/core.js?v=1.6.0';
+import { getRuntimeSupervisor } from './lib/runtime-supervisor.js?v=1.6.0';
+import { prepareModuleGraph } from './lib/module-graph.js?v=1.6.0';
 
-const PLUGIN_VERSION = '1.5.5';
+const PLUGIN_VERSION = '1.6.0';
 const MODULE_ID = 'extension_hot_reload';
 const LOG_PREFIX = '[Extension Hot Reload]';
 const ROOT_ID = 'extension-hot-reload-settings';
@@ -63,8 +64,15 @@ const DEFAULT_SETTINGS = Object.freeze({
 
 const { extension_settings, loadExtensionSettings } = extensionsApi;
 
-/** @type {Map<string, object>} */
-const runtimeManifests = new Map();
+// Preserve live namespaces and lazy-import URLs when this updater updates itself.
+const RUNTIME_STATE_SYMBOL = Symbol.for('sillytavern.extension-hot-reload.live-modules');
+const runtimeState = globalThis[RUNTIME_STATE_SYMBOL] ??= {
+    manifests: new Map(), modules: new Map(), graphs: new Map(), pending: new Map(),
+};
+const runtimeManifests = runtimeState.manifests;
+const runtimeModules = runtimeState.modules;
+const runtimeGraphs = runtimeState.graphs;
+const pendingApplications = runtimeState.pending;
 /** @type {Set<string>} */
 const updating = new Set();
 /** @type {Set<string>} */
@@ -195,7 +203,7 @@ function renderSettings() {
 
     const intro = document.createElement('div');
     intro.className = 'ehr-notice';
-    intro.textContent = '优先使用扩展自带的清理钩子；无钩子的常规单文件扩展可由 Runtime Supervisor 托管，无法证明安全时仍会无感重启。';
+    intro.textContent = '安全模式允许无感重启。选择“强制热更新（不刷新）”或使用同名批量按钮，可尝试在当前页面换新入口和本地子模块；失败只提示，不自动刷新。';
 
     body.append(
         intro,
@@ -210,10 +218,10 @@ function renderSettings() {
     const modeRow = document.createElement('label');
     modeRow.className = 'ehr-mode-row';
     const modeText = document.createElement('span');
-    modeText.innerHTML = '<strong>脚本策略</strong><small>强制模式可能造成重复事件监听或定时器。</small>';
+    modeText.innerHTML = '<strong>脚本策略</strong><small>强制模式先回收已追踪资源，但未追踪的全局修改和监听器仍可能残留。失败保持页面，需手动处理。</small>';
     const select = document.createElement('select');
     select.className = 'text_pole';
-    select.append(new Option('安全模式（推荐）', HOT_RELOAD_MODE.SAFE), new Option('实验性强制热载入', HOT_RELOAD_MODE.FORCE));
+    select.append(new Option('安全模式（允许无感重启）', HOT_RELOAD_MODE.SAFE), new Option('强制热更新（不刷新）', HOT_RELOAD_MODE.FORCE));
     select.value = settings.mode;
     select.addEventListener('change', () => {
         settings.mode = select.value;
@@ -239,20 +247,21 @@ function renderSettings() {
     return true;
 }
 
-function makeBulkButton() {
+function makeBulkButton(mode = '') {
     const button = document.createElement('button');
     button.type = 'button';
     button.className = `menu_button menu_button_icon ${BULK_BUTTON_CLASS}`;
-    button.title = '智能热更新当前检测到的全部扩展';
+    button.dataset.ehrMode = mode || 'settings';
+    button.title = mode ? '尝试更新全部插件及本地子模块；失败保持页面，不自动刷新' : '按当前脚本策略更新全部扩展';
     const icon = document.createElement('i');
     icon.className = 'fa-solid fa-fire-flame-curved fa-fw';
     const label = document.createElement('span');
-    label.textContent = '智能热更新全部';
+    label.textContent = mode ? '强制热更新全部（不刷新）' : '智能热更新全部';
     button.append(icon, label);
     button.addEventListener('click', (event) => {
         event.preventDefault();
         event.stopPropagation();
-        void updateAllVisible(button);
+        void updateAllVisible(button, mode ? { mode } : {});
     });
     return button;
 }
@@ -288,6 +297,16 @@ function findManagerToolbars() {
 }
 
 function decorateManager() {
+    for (const block of document.querySelectorAll('.extensions_info .extension_block')) {
+        if (!block.dataset.name) continue;
+        const pending = pendingApplications.get(toInternalId(block.dataset.name));
+        if (!pending) continue;
+        const button = block.querySelector('.btn_update');
+        button?.classList.remove('displayNone');
+        if (button) button.title = pending.runtimeTouched
+            ? '运行时已部分变更，请手动刷新恢复'
+            : '文件已更新，点击重试应用到当前页面';
+    }
     document.querySelectorAll(`.${BULK_BUTTON_CLASS}`).forEach((button) => {
         button.classList.toggle('displayNone', !settings?.showBulkButton);
     });
@@ -295,8 +314,11 @@ function decorateManager() {
         return;
     }
     for (const toolbar of findManagerToolbars()) {
-        if (!toolbar.querySelector(`.${BULK_BUTTON_CLASS}`)) {
+        if (!toolbar.querySelector(`.${BULK_BUTTON_CLASS}[data-ehr-mode="settings"]`)) {
             toolbar.prepend(makeBulkButton());
+        }
+        if (!toolbar.querySelector(`.${BULK_BUTTON_CLASS}[data-ehr-mode="force"]`)) {
+            toolbar.append(makeBulkButton(HOT_RELOAD_MODE.FORCE));
         }
     }
 }
@@ -691,6 +713,7 @@ async function performSeamlessRestart(updatedExtensions, action = 'update') {
 }
 
 async function requestSeamlessRestart(updatedExtensions, action = 'update') {
+    if (action === 'update' && settings.mode === HOT_RELOAD_MODE.FORCE) return;
     if (!settings.seamlessFallback || restartPending) return;
     if (!isGenerating()) {
         await performSeamlessRestart(updatedExtensions, action);
@@ -704,7 +727,9 @@ async function requestSeamlessRestart(updatedExtensions, action = 'update') {
         eventSource.removeListener(event_types.GENERATION_STOPPED, resume);
         generationResumeHandler = null;
         restartPending = false;
-        void performSeamlessRestart(updatedExtensions, action);
+        if (action !== 'update' || settings.mode !== HOT_RELOAD_MODE.FORCE) {
+            void performSeamlessRestart(updatedExtensions, action);
+        }
     };
     generationResumeHandler = resume;
     eventSource.once(event_types.GENERATION_ENDED, resume);
@@ -712,12 +737,41 @@ async function requestSeamlessRestart(updatedExtensions, action = 'update') {
 }
 
 async function importExtensionModule(internalId, manifest, token = '') {
+    if (!token && runtimeModules.has(internalId)) return runtimeModules.get(internalId);
     if (!manifest?.js) {
         return null;
     }
     const baseUrl = buildAssetUrl(internalId, manifest.js);
     const url = token ? withCacheBuster(baseUrl, token) : baseUrl;
     return promiseWithTimeout(import(url), ASSET_REQUEST_TIMEOUT, 'Extension module import timed out.');
+}
+
+async function prepareFreshGraph(internalId, manifest, token) {
+    // Check blob-module CSP support before touching the running extension.
+    const probeUrl = URL.createObjectURL(new Blob(['export {};'], { type: 'text/javascript' }));
+    try {
+        await promiseWithTimeout(import(probeUrl), ASSET_REQUEST_TIMEOUT, 'Blob 模块能力检测超时。');
+    } finally {
+        URL.revokeObjectURL(probeUrl);
+    }
+    const rootUrl = new URL('./', new URL(buildAssetUrl(internalId, 'manifest.json'), location.origin));
+    return prepareModuleGraph({
+        entryUrl: new URL(buildAssetUrl(internalId, manifest.js), location.origin),
+        rootUrl,
+        token,
+        onModule: (url) => runtimeSupervisor.registerModuleUrl?.(internalId, url),
+        revokeUrl: (url) => {
+            runtimeSupervisor.unregisterModuleUrl?.(url);
+            URL.revokeObjectURL(url);
+        },
+        fetchSource: async (url) => {
+            const response = await fetch(url, {
+                cache: 'no-store', credentials: 'same-origin', signal: timeoutSignal(ASSET_REQUEST_TIMEOUT),
+            });
+            if (!response.ok) throw new Error(`无法加载新版模块 (${response.status})：${url}`);
+            return response.text();
+        },
+    });
 }
 
 function promiseWithTimeout(promise, milliseconds, message) {
@@ -1017,6 +1071,10 @@ async function confirmAndDelete(rawId, button) {
         removeExtensionStyles(internalId, manifest);
         removeManagerRows(externalId);
         runtimeManifests.delete(internalId);
+        runtimeModules.delete(internalId);
+        runtimeGraphs.get(internalId)?.dispose();
+        runtimeGraphs.delete(internalId);
+        pendingApplications.delete(internalId);
         runtimeSupervisor.discard(internalId);
         extension_settings.disabledExtensions = (extension_settings.disabledExtensions ?? []).filter((name) => name !== internalId);
         await saveSettings();
@@ -1088,6 +1146,7 @@ async function replaceStyles(internalId, oldManifest, newManifest, token) {
 }
 
 function updateManagerRow(externalId, newManifest, shortHash) {
+    const pending = pendingApplications.has(toInternalId(externalId));
     for (const block of document.querySelectorAll('.extension_block')) {
         if (block.dataset.name !== externalId) {
             continue;
@@ -1097,11 +1156,18 @@ function updateManagerRow(externalId, newManifest, shortHash) {
         if (version) {
             version.textContent = `${newManifest.version ?? ''}${shortHash ? ` (${shortHash})` : ''}`;
         }
-        block.querySelector('.btn_update')?.classList.add('displayNone');
+        const updateButton = block.querySelector('.btn_update');
+        updateButton?.classList.toggle('displayNone', !pending);
+        if (updateButton) updateButton.title = pendingApplications.get(toInternalId(externalId))?.runtimeTouched
+            ? '运行时已部分变更，请手动刷新恢复'
+            : pending ? '文件已更新，点击重试应用到当前页面' : '扩展已更新';
     }
 }
 
 async function updateOne(rawId, button = null, options = {}) {
+    // Freeze this operation's policy, including when settings change mid-request.
+    const forceReload = (options.mode ?? settings.mode) === HOT_RELOAD_MODE.FORCE;
+    const allowAutoRestart = !forceReload;
     let externalId;
     try {
         externalId = normalizeExternalId(rawId);
@@ -1114,12 +1180,18 @@ async function updateOne(rawId, button = null, options = {}) {
     }
 
     const internalId = toInternalId(externalId);
+    if (pendingApplications.get(internalId)?.runtimeTouched) {
+        const message = `${externalId} 上次热载入后运行时已部分变更，请手动刷新恢复后再更新。`;
+        if (!options.quiet) notify('warning', message);
+        return { status: 'needs-page-reload', message, updateVerified: true, allowAutoRestart, displayName: externalId };
+    }
     const oldManifest = await getManifest(internalId);
     if (!oldManifest) {
         const error = new Error(`找不到 ${externalId} 的 manifest。`);
         notify('error', error.message);
         return { status: 'failed', error };
     }
+    runtimeManifests.set(internalId, oldManifest);
 
     updating.add(externalId);
     button?.setAttribute('disabled', 'disabled');
@@ -1130,6 +1202,8 @@ async function updateOne(rawId, button = null, options = {}) {
     let runtimeTouched = false;
     let result = null;
     let newManifest = null;
+    let freshGraph = null;
+    let graphActivated = false;
 
     try {
         const isGlobal = resolveExtensionType(extensionsApi.extensionTypes, externalId) === 'global';
@@ -1144,7 +1218,7 @@ async function updateOne(rawId, button = null, options = {}) {
             isDisabled,
             hasCleanupHook: Boolean(cleanupHook),
             hasManagedRuntime: managedAssessment.eligible,
-            mode: settings.mode,
+            mode: forceReload ? HOT_RELOAD_MODE.FORCE : HOT_RELOAD_MODE.SAFE,
         });
 
         log('Updating', {
@@ -1155,12 +1229,13 @@ async function updateOne(rawId, button = null, options = {}) {
             managedAssessment,
         });
         result = await updateRepository(externalId, isGlobal);
-        if (result.isUpToDate) {
+        if (result.isUpToDate && !pendingApplications.has(internalId)) {
             if (!options.quiet) notify('success', `${oldManifest.display_name ?? externalId} 已经是最新版本。`);
             updateManagerRow(externalId, oldManifest, result.shortCommitHash);
             return { status: 'up-to-date', result, displayName: oldManifest.display_name ?? externalId };
         }
         repositoryUpdated = true;
+        pendingApplications.set(internalId, { runtimeTouched: false });
 
         const token = `${result.shortCommitHash ?? 'updated'}-${Date.now()}`;
         await evictExtensionAssetCaches(internalId);
@@ -1175,12 +1250,12 @@ async function updateOne(rawId, button = null, options = {}) {
             try {
                 const inspection = await inspectExtensionEntry(internalId, newManifest, token);
                 const localDependencies = inspection.localDependencies;
-                if (policy.reason === 'managed' && inspection.risks.length > 0) {
+                if (policy.reason === 'managed' && inspection.risks.length > 0 && !forceReload) {
                     policy = { reloadScript: false, needsPageReload: true, reason: 'managed-source-risk' };
                     log('Updated source is not eligible for managed reload', { externalId, risks: inspection.risks });
                 } else if (localDependencies.length > 0) {
-                    if (hasSelfManagedModules(newManifest)) {
-                        log('Extension opted into self-managed local modules', { externalId, localDependencies });
+                    if (forceReload || hasSelfManagedModules(newManifest)) {
+                        log('Local modules will be refreshed', { externalId, localDependencies, forceReload });
                     } else {
                         policy = { reloadScript: false, needsPageReload: true, reason: 'multi-file-module' };
                         log('Local module dependencies require a seamless restart', { externalId, localDependencies });
@@ -1191,13 +1266,18 @@ async function updateOne(rawId, button = null, options = {}) {
                 policy = { reloadScript: false, needsPageReload: true, reason: 'module-inspection-failed' };
             }
         }
+        // Fetch and parse the entire supported graph before stopping old code.
+        // This also covers single-file entries with computed dynamic imports.
+        if (forceReload && policy.reloadScript && !hasSelfManagedModules(newManifest)) {
+            freshGraph = await prepareFreshGraph(internalId, newManifest, token);
+        }
         const hookContext = Object.freeze({
             reason: 'hot-update',
             extensionName: internalId,
             previousManifest: structuredClone(oldManifest),
             manifest: structuredClone(newManifest),
         });
-        const assetWarmup = !isDisabled && policy.needsPageReload
+        const assetWarmup = !isDisabled && policy.needsPageReload && allowAutoRestart
             ? warmExtensionAssets(internalId, newManifest)
             : Promise.resolve();
 
@@ -1219,12 +1299,28 @@ async function updateOne(rawId, button = null, options = {}) {
                     `${cleanupHook.name} hook timed out.`,
                 );
                 runtimeSupervisor?.discard(internalId);
+            } else if (forceReload && runtimeSupervisor.getSnapshot(internalId).activeResources > 0) {
+                runtimeTouched = true;
+                const disposal = await runtimeSupervisor.dispose(internalId);
+                log('Best-effort forced runtime cleanup', { externalId, disposal });
+                if (!disposal.complete) {
+                    throw new Error(`已追踪资源清理失败：${disposal.failures.join('; ')}`);
+                }
             }
             try {
                 runtimeTouched = true;
-                const newModule = await importExtensionModule(internalId, newManifest, token);
+                const newModule = freshGraph
+                    ? await promiseWithTimeout(import(freshGraph.entryUrl), ASSET_REQUEST_TIMEOUT, '新版模块加载超时。')
+                    : await importExtensionModule(internalId, newManifest, token);
                 await invokeManifestHook(newModule, newManifest, 'update', hookContext);
                 await invokeManifestHook(newModule, newManifest, 'activate', hookContext);
+                runtimeModules.set(internalId, newModule);
+                runtimeGraphs.get(internalId)?.dispose();
+                runtimeGraphs.delete(internalId);
+                if (freshGraph) {
+                    runtimeGraphs.set(internalId, freshGraph);
+                    graphActivated = true;
+                }
                 scriptReloaded = true;
             } catch (error) {
                 if (cleanupHook && oldModule) {
@@ -1251,7 +1347,10 @@ async function updateOne(rawId, button = null, options = {}) {
 
         await assetWarmup;
 
-        runtimeManifests.set(internalId, newManifest);
+        if (!policy.needsPageReload) {
+            runtimeManifests.set(internalId, newManifest);
+            pendingApplications.delete(internalId);
+        }
         updateManagerRow(externalId, newManifest, result.shortCommitHash);
 
         let status = 'files-updated';
@@ -1267,17 +1366,18 @@ async function updateOne(rawId, button = null, options = {}) {
                         : policy.reason === 'managed-source-risk'
                             ? '新版脚本包含无法可靠回收的运行时操作'
                             : '脚本没有清理钩子';
-            message = settings.seamlessFallback
+            message = settings.seamlessFallback && allowAutoRestart
                 ? `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，将自动无感重启以安全应用。`
-                : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}，请稍后刷新页面。`;
+                : `${newManifest.display_name ?? externalId} 的文件${styleReloaded ? '和样式' : ''}已更新；${reloadReason}。当前页面保持不变，需手动刷新后完整应用。`;
         } else if (isDisabled) {
             status = 'updated-disabled';
             message = `${newManifest.display_name ?? externalId} 已更新；它当前未启用，不需要重载运行中的脚本。`;
         } else if (scriptReloaded) {
-            status = policy.reason === 'forced'
+            status = forceReload
                 ? 'force-reloaded'
                 : policy.reason === 'managed' ? 'managed-reloaded' : 'hot-reloaded';
-            const method = policy.reason === 'managed' ? '并由 Runtime Supervisor 完成托管换新' : '并热载入';
+            const method = forceReload ? `并强制热载入${freshGraph ? `（${freshGraph.moduleCount} 个模块）` : ''}`
+                : policy.reason === 'managed' ? '并由 Runtime Supervisor 完成托管换新' : '并热载入';
             message = `${newManifest.display_name ?? externalId} 已更新${method}${styleReloaded ? '（含样式）' : ''}。`;
         } else if (!oldManifest.js) {
             status = 'style-reloaded';
@@ -1294,18 +1394,19 @@ async function updateOne(rawId, button = null, options = {}) {
             message,
             displayName: newManifest.display_name ?? externalId,
             updateVerified,
+            allowAutoRestart,
         };
     } catch (error) {
         console.error(LOG_PREFIX, `Failed to update ${externalId}:`, error);
         if (repositoryUpdated && updateVerified) {
             const displayName = newManifest?.display_name ?? oldManifest.display_name ?? externalId;
+            pendingApplications.set(internalId, { runtimeTouched });
             if (newManifest) {
-                runtimeManifests.set(internalId, newManifest);
                 updateManagerRow(externalId, newManifest, result?.shortCommitHash);
             }
-            const recovery = settings.seamlessFallback
+            const recovery = settings.seamlessFallback && allowAutoRestart
                 ? '热载入未能安全完成，已自动切换无感重启恢复干净运行环境。'
-                : '热载入未能安全完成，请刷新页面以恢复干净运行环境。';
+                : `热载入未完成，未自动刷新页面。${error.message} ${runtimeTouched ? '运行时可能已部分变更，请手动刷新恢复。' : '旧运行时尚未卸载；可重试热载入或手动刷新。'}`;
             const message = `${displayName} 的 Git 更新已完成；${recovery}`;
             log('Post-update failure requires a clean runtime', { externalId, runtimeTouched, error });
             if (!options.quiet) notify('warning', message);
@@ -1316,6 +1417,7 @@ async function updateOne(rawId, button = null, options = {}) {
                 message,
                 displayName,
                 updateVerified,
+                allowAutoRestart,
                 recoveryReason: runtimeTouched ? 'runtime-touched' : 'post-update-failure',
             };
         }
@@ -1335,14 +1437,16 @@ async function updateOne(rawId, button = null, options = {}) {
         if (!options.quiet) notify('error', `${externalId} 更新失败：${error.message}`);
         return { status: 'failed', error, updateVerified: false };
     } finally {
+        if (freshGraph && !graphActivated) freshGraph.dispose();
         updating.delete(externalId);
         button?.removeAttribute('disabled');
         button?.querySelector('i')?.classList.remove('fa-spin');
     }
 }
 
-async function updateAllVisible(button) {
+async function updateAllVisible(button, options = {}) {
     if (button.disabled) return;
+    options = { ...options, mode: options.mode ?? settings.mode };
     const targets = [...document.querySelectorAll('.extensions_info .extension_block .btn_update:not(.displayNone)')]
         .map((item) => item.dataset.name)
         .filter(Boolean);
@@ -1355,7 +1459,7 @@ async function updateAllVisible(button) {
     button.querySelector('i')?.classList.add('fa-spin');
     const results = [];
     for (const id of targets) {
-        results.push(await updateOne(id, null, { quiet: true }));
+        results.push(await updateOne(id, null, { ...options, quiet: true }));
     }
     button.disabled = false;
     button.querySelector('i')?.classList.remove('fa-spin');
@@ -1363,12 +1467,14 @@ async function updateAllVisible(button) {
     const failed = results.filter((item) => item.status === 'failed').length;
     const unverified = results.filter((item) => item.status === 'updated-unverified').length;
     const needsReload = results.filter(shouldAutoRestartUpdate).length;
+    const manualReload = results.filter((item) => item.status === 'needs-page-reload' && item.allowAutoRestart === false).length;
     const hot = results.filter((item) => ['hot-reloaded', 'managed-reloaded', 'force-reloaded', 'style-reloaded', 'updated-disabled'].includes(item.status)).length;
-    const unresolvedText = unverified ? `，${unverified} 个结果未验证且不会自动重启` : '';
+    const unresolvedText = (unverified ? `，${unverified} 个结果未验证且不会自动重启` : '')
+        + (manualReload ? `，${manualReload} 个未能热应用（页面未刷新，需手动处理）` : '');
     const summary = settings.seamlessFallback && needsReload
         ? `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个将通过一次无感重启应用，${failed} 个失败${unresolvedText}。`
         : `完成 ${results.length} 个：${hot} 个已直接应用，${needsReload} 个脚本需稍后刷新，${failed} 个失败${unresolvedText}。`;
-    notify(failed || unverified ? 'warning' : needsReload ? 'warning' : 'success', summary, '批量热更新完成');
+    notify(failed || unverified || manualReload ? 'warning' : needsReload ? 'warning' : 'success', summary, '批量热更新完成');
     if (needsReload && settings.seamlessFallback) {
         const names = results.filter(shouldAutoRestartUpdate).map((item) => item.displayName);
         await requestSeamlessRestart(names);

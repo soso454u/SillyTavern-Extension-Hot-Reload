@@ -1,11 +1,11 @@
 {
   "name": "sillytavern-extension-hot-reload",
-  "version": "1.5.5",
+  "version": "1.6.0",
   "private": true,
   "type": "module",
   "scripts": {
     "test": "node --test",
-    "check": "node --check index.js && node --check lib/core.js && node --check lib/runtime-supervisor.js"
+    "check": "node --check index.js && node --check lib/core.js && node --check lib/runtime-supervisor.js && node --check lib/module-graph.js"
   },
   "engines": {
     "node": ">=18"

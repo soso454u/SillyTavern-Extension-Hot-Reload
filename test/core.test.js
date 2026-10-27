@@ -68,6 +68,7 @@ test('allows automatic restart only after a verified update', () => {
     assert.equal(shouldAutoRestartUpdate({ status: 'needs-page-reload', updateVerified: true }), true);
     assert.equal(shouldAutoRestartUpdate({ status: 'needs-page-reload', updateVerified: false }), false);
     assert.equal(shouldAutoRestartUpdate({ status: 'failed', updateVerified: true }), false);
+    assert.equal(shouldAutoRestartUpdate({ status: 'needs-page-reload', updateVerified: true, allowAutoRestart: false }), false);
 });
 
 test('uses a one-shot navigation token without changing restart-state identity', () => {
